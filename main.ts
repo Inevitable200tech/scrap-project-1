@@ -5,12 +5,12 @@ import playwrightExtra from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import * as cheerio from 'cheerio';
 import rateLimit from 'express-rate-limit';
-import * as path from 'path';
 import * as os from 'os';
+import * as path from 'path';
 
 playwrightExtra.chromium.use(StealthPlugin());
 
-// ── Persistent Playwright context (reused across requests) ──────────────────
+// Persistent context
 let persistentContext: any = null;
 
 async function getPersistentContext() {
@@ -50,106 +50,186 @@ async function getPersistentContext() {
   return persistentContext;
 }
 
-// ── Rate limiting: 10 requests per minute per IP ─────────────────────────────
+// Rate limiting: 10 requests per IP per minute
 const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 10,             // limit each IP to 10 requests per windowMs
-  message: {
-    error: 'Too many requests from this IP. Please try again in 60 seconds.',
-  },
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { error: 'Rate limit exceeded. Please wait 60 seconds.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// ── Express app ──────────────────────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 app.use(limiter);
 
-// Only allow dropmms.co URLs
-const ALLOWED_PREFIXES = ['http://dropmms.co', 'https://dropmms.co'];
+// Allowed domains
+const ALLOWED_PREFIXES = [
+  'http://dropmms.co',
+  'https://dropmms.co',
+  'https://videmms24.com'
+];
+
+// Domain lists for classification
+const zipDomains = [
+  'upfiles.com',
+  'file-upload.org',
+  'zapupload.top',
+  'frdl.io'
+  // ← add more file hosters here
+];
+
+const videoDomains = [
+  'strmup.cc',
+  'luluvid.com',
+  'vidnest.io',
+  'vidoza.net',
+  'streamtape.com',
+  'vinovo.to',
+  'up4fun.top'
+  // ← add more video hosts here
+];
+
+const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
 
 app.post('/api/scrape', async (req: Request, res: Response) => {
   const { url } = req.body;
 
   if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid "url" parameter' });
+    return res.status(400).json({ error: 'Missing or invalid "url"' });
   }
 
-  // Validate URL prefix
   if (!ALLOWED_PREFIXES.some(prefix => url.startsWith(prefix))) {
-    return res.status(403).json({ error: 'Only dropmms.co URLs are allowed' });
+    return res.status(403).json({ error: 'Only dropmms.co / videmms24.com URLs allowed' });
   }
 
   try {
     const context = await getPersistentContext();
     const page = await context.newPage();
 
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    console.log(`\nScraping: ${url}`);
 
-    // Cloudflare wait (if present)
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+
+    // Cloudflare handling
     try {
       const title = await page.title();
       if (title.includes('Just a moment') || title.includes('Attention Required')) {
+        console.log('Cloudflare challenge detected — waiting...');
         await page.waitForTimeout(15000 + Math.random() * 10000);
       }
     } catch {}
 
-    // Wait for main content
-    await page.waitForSelector('.ipsType_pageTitle, [data-role="commentContent"]', { timeout: 30000 });
+    await page.waitForTimeout(5000 + Math.random() * 3000);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(3000);
 
     const html = await page.content();
-
     await page.close();
 
     const $ = cheerio.load(html);
 
     // ── Extract title ────────────────────────────────────────────────────────
-    const title = $('h1.ipsType_pageTitle span.ipsContained span').first().text().trim() ||
-                  $('h1.ipsType_pageTitle').first().text().trim() ||
-                  'Untitled Thread';
-
-    // ── Extract videos (▶️ prefixed links) ───────────────────────────────────
-    const videos: string[] = [];
-    const streamRegex = /▶️\s*(https?:\/\/[^\s<]+)/gi;
-    const fullText = $('[data-role="commentContent"]').text().trim();
-    let match;
-    while ((match = streamRegex.exec(fullText)) !== null) {
-      videos.push(match[1].trim());
+    let title = $('h1.ipsType_pageTitle span.ipsContained span').first().text().trim();
+    if (!title) {
+      title = $('h1.ipsType_pageTitle').first().text().trim() || 'Untitled Thread';
     }
+    console.log(`Title: ${title}`);
 
-    // ── Extract images ───────────────────────────────────────────────────────
+    // ── Focus only on .cPost_contentWrap blocks ─────────────────────────────
+    const contentWraps = $('.cPost_contentWrap');
+
+    console.log(`Found ${contentWraps.length} .cPost_contentWrap blocks`);
+
+    const videos: string[] = [];
     const images: string[] = [];
-    $('img.ipsImage').each((_, img) => {
-      let src = $(img).attr('src') || $(img).attr('data-src') || '';
-      if (src && (src.includes('imagetwist.com') || src.includes('img202.'))) {
-        images.push(src);
-      }
+    const zips: string[] = [];
+
+    contentWraps.each((i, wrap) => {
+      const $wrap = $(wrap);
+
+      console.log(`\n--- Content block ${i + 1} ---`);
+
+      // Text preview (first 400 chars)
+      const textPreview = $wrap.text().trim().replace(/\s+/g, ' ').slice(0, 400);
+      console.log(`Text preview: ${textPreview}...`);
+
+      // ── All <a href="http..."> links inside this block ───────────────────
+      const links: string[] = [];
+      $wrap.find('a[href^="http"]').each((_, a) => {
+        const href = $(a).attr('href')?.trim() || '';
+        if (href) {
+          links.push(href);
+          console.log(`Link: ${href}`);
+        }
+      });
+
+      // Classify links
+      links.forEach(href => {
+        const hostname = new URL(href).hostname.toLowerCase();
+
+        // Zip / file download
+        if (zipDomains.some(d => hostname.includes(d))) {
+          if (!zips.includes(href)) zips.push(href);
+          return;
+        }
+
+        // Video / stream
+        if (videoDomains.some(d => hostname.includes(d))) {
+          if (!videos.includes(href)) videos.push(href);
+          return;
+        }
+      });
+
+      // ── Images: only inside .cPost_contentWrap ───────────────────────────
+      $wrap.find('img').each((_, img) => {
+        let src = $(img).attr('src') || $(img).attr('data-src') || '';
+        if (!src.startsWith('http')) return;
+
+        const ext = src.toLowerCase().split('?')[0].slice(-5);
+        if (imageExtensions.some(e => ext.endsWith(e))) {
+          // Prefer parent <a> href if it looks like full-res image
+          const $parentA = $(img).closest('a[href]');
+          if ($parentA.length) {
+            const parentHref = $parentA.attr('href')?.trim() || '';
+            const parentExt = parentHref.toLowerCase().split('?')[0].slice(-5);
+            if (imageExtensions.some(e => parentExt.endsWith(e))) {
+              src = parentHref;
+            }
+          }
+
+          if (!images.includes(src)) {
+            images.push(src);
+            console.log(`Captured image: ${src} (class: ${$(img).attr('class') || 'none'})`);
+          }
+        }
+      });
     });
 
-    // ── Response ─────────────────────────────────────────────────────────────
-    return res.json({
+    // ── Final response ───────────────────────────────────────────────────────
+    return res.status(200).json({
       title,
       videos,
       images,
+      zips
     });
   } catch (error: any) {
-    console.error('Scrape error:', error);
+    console.error(`Scrape failed for ${req.body.url}:`, error.message);
     return res.status(500).json({
-      error: 'Failed to scrape the page',
-      details: error.message || 'Unknown error',
+      error: 'Failed to scrape page',
+      details: error.message || 'Internal error'
     });
   }
 });
 
-// Health check endpoint
+// Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`POST to /api/scrape with JSON body: { "url": "https://dropmms.co/topic/..." }`);
+  console.log(`POST /api/scrape → { "url": "https://..." }`);
 });
