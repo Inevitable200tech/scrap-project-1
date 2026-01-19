@@ -6,7 +6,6 @@
   "main": "dist/main.js",
   "scripts": {
     "start": "tsx main.ts",
-    "build": "tsc",
     "dev": "tsx --watch main.ts"
   },
   "dependencies": {
