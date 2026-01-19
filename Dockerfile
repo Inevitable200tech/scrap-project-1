@@ -1,19 +1,22 @@
-# Use official Playwright image with all dependencies pre-installed
+# Use official Playwright image (all dependencies + Chromium pre-installed)
 FROM mcr.microsoft.com/playwright:v1.49.0-jammy
 
-# Set working directory inside container
+# Set working directory
 WORKDIR /app
 
-# Copy package files first (optimizes caching)
+# Copy package files
 COPY package*.json ./
 
 # Install Node.js dependencies
-RUN npm ci
+RUN npm ci --omit=dev
 
-# Copy the rest of your application code
+# Copy source code
 COPY . .
 
-# Expose the port your app listens on
+# ← ADD THIS LINE: Compile TypeScript to JavaScript
+RUN npm run build
+
+# Expose port
 EXPOSE 3000
 
 # Start the server
