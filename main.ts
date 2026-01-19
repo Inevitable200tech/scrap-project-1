@@ -1,6 +1,6 @@
-// server.ts
+// server.ts — With comprehensive request & flow debugging
 
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import playwrightExtra from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import * as cheerio from 'cheerio';
@@ -16,7 +16,7 @@ let persistentContext: any = null;
 async function getPersistentContext() {
   if (!persistentContext) {
     const userDataDir = path.join(os.tmpdir(), 'dropmms-api-profile');
-    console.log(`Persistent profile: ${userDataDir}`);
+    console.log(`[DEBUG] Creating persistent profile: ${userDataDir}`);
 
     persistentContext = await playwrightExtra.chromium.launchPersistentContext(
       userDataDir,
@@ -50,10 +50,10 @@ async function getPersistentContext() {
   return persistentContext;
 }
 
-// Rate limiting: 10 requests per IP per minute
+// Rate limiting (60/min — should be safe now)
 const limiter = rateLimit({
-  windowMs: 60 * 1000,   // still 1 minute
-  max: 60,               // ← allow 1 request per second (60/min)
+  windowMs: 60 * 1000,
+  max: 60,
   message: { error: 'Rate limit exceeded. Please wait.' },
   standardHeaders: true,
   legacyHeaders: false,
@@ -62,8 +62,29 @@ const limiter = rateLimit({
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(limiter);
+
+// ── GLOBAL REQUEST LOGGER ───────────────────────────────────────────────────
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const start = Date.now();
+
+  console.log(`\n[INCOMING] ${req.method} ${req.originalUrl} | IP: ${req.ip}`);
+  console.log(`[HEADERS] ${JSON.stringify(req.headers, null, 2)}`);
+
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log(`[BODY] ${JSON.stringify(req.body, null, 2)}`);
+  } else {
+    console.log('[BODY] Empty or no JSON body');
+  }
+
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`[OUTGOING] ${req.method} ${req.originalUrl} → ${res.statusCode} (${duration}ms)`);
+  });
+
+  next();
+});
 
 // Allowed domains
 const ALLOWED_PREFIXES = [
@@ -72,76 +93,64 @@ const ALLOWED_PREFIXES = [
   'https://videmms24.com'
 ];
 
-// Domain lists for classification
-const zipDomains = [
-  'upfiles.com',
-  'file-upload.org',
-  'zapupload.top',
-  'frdl.io'
-  // ← add more file hosters here
-];
-
-const videoDomains = [
-  'strmup.cc',
-  'luluvid.com',
-  'vidnest.io',
-  'vidoza.net',
-  'streamtape.com',
-  'vinovo.to',
-  'up4fun.top'
-  // ← add more video hosts here
-];
-
+const zipDomains = ['upfiles.com', 'file-upload.org', 'zapupload.top', 'frdl.io'];
+const videoDomains = ['strmup.cc', 'luluvid.com', 'vidnest.io', 'vidoza.net', 'streamtape.com', 'vinovo.to', 'up4fun.top'];
 const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
 
+// ── SCRAPE ENDPOINT ─────────────────────────────────────────────────────────
 app.post('/api/scrape', async (req: Request, res: Response) => {
+  console.log('[ROUTE] /api/scrape handler STARTED');
+
   const { url } = req.body;
 
   if (!url || typeof url !== 'string') {
+    console.log('[VALIDATION] Failed: Missing or invalid "url"');
     return res.status(400).json({ error: 'Missing or invalid "url"' });
   }
 
+  console.log(`[VALIDATION] URL received: ${url}`);
+
   if (!ALLOWED_PREFIXES.some(prefix => url.startsWith(prefix))) {
+    console.log(`[VALIDATION] Failed: Disallowed domain → ${url}`);
     return res.status(403).json({ error: 'Only dropmms.co / videmms24.com URLs allowed' });
   }
+
+  console.log('[VALIDATION] Passed — proceeding to scrape');
 
   try {
     const context = await getPersistentContext();
     const page = await context.newPage();
 
-    console.log(`\nScraping: ${url}`);
-
+    console.log(`[PLAYWRIGHT] Navigating to: ${url}`);
     await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
 
-    // Cloudflare handling
-    try {
-      const title = await page.title();
-      if (title.includes('Just a moment') || title.includes('Attention Required')) {
-        console.log('Cloudflare challenge detected — waiting...');
-        await page.waitForTimeout(15000 + Math.random() * 10000);
-      }
-    } catch {}
+    const pageTitle = await page.title();
+    console.log(`[PLAYWRIGHT] Loaded page title: "${pageTitle}"`);
 
+    if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
+      console.log('[PLAYWRIGHT] Cloudflare challenge → waiting 15–25s');
+      await page.waitForTimeout(15000 + Math.random() * 10000);
+    }
+
+    console.log('[PLAYWRIGHT] Applying scroll & delay');
     await page.waitForTimeout(5000 + Math.random() * 3000);
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(3000);
 
     const html = await page.content();
     await page.close();
+    console.log('[PLAYWRIGHT] Page content fetched — length:', html.length);
 
     const $ = cheerio.load(html);
 
-    // ── Extract title ────────────────────────────────────────────────────────
     let title = $('h1.ipsType_pageTitle span.ipsContained span').first().text().trim();
     if (!title) {
       title = $('h1.ipsType_pageTitle').first().text().trim() || 'Untitled Thread';
     }
-    console.log(`Title: ${title}`);
+    console.log(`[EXTRACTION] Title: "${title}"`);
 
-    // ── Focus only on .cPost_contentWrap blocks ─────────────────────────────
     const contentWraps = $('.cPost_contentWrap');
-
-    console.log(`Found ${contentWraps.length} .cPost_contentWrap blocks`);
+    console.log(`[EXTRACTION] Found ${contentWraps.length} .cPost_contentWrap blocks`);
 
     const videos: string[] = [];
     const images: string[] = [];
@@ -149,66 +158,58 @@ app.post('/api/scrape', async (req: Request, res: Response) => {
 
     contentWraps.each((i, wrap) => {
       const $wrap = $(wrap);
+      console.log(`\n[Block ${i + 1}] ───────────────────────────────`);
 
-      console.log(`\n--- Content block ${i + 1} ---`);
-
-      // Text preview (first 400 chars)
-      const textPreview = $wrap.text().trim().replace(/\s+/g, ' ').slice(0, 400);
+      const textPreview = $wrap.text().trim().replace(/\s+/g, ' ').slice(0, 300);
       console.log(`Text preview: ${textPreview}...`);
 
-      // ── All <a href="http..."> links inside this block ───────────────────
+      // Links
       const links: string[] = [];
       $wrap.find('a[href^="http"]').each((_, a) => {
         const href = $(a).attr('href')?.trim() || '';
         if (href) {
           links.push(href);
-          console.log(`Link: ${href}`);
+          console.log(`  Link: ${href}`);
         }
       });
 
-      // Classify links
       links.forEach(href => {
         const hostname = new URL(href).hostname.toLowerCase();
-
-        // Zip / file download
         if (zipDomains.some(d => hostname.includes(d))) {
           if (!zips.includes(href)) zips.push(href);
-          return;
-        }
-
-        // Video / stream
-        if (videoDomains.some(d => hostname.includes(d))) {
+          console.log(`    → Classified as ZIP`);
+        } else if (videoDomains.some(d => hostname.includes(d))) {
           if (!videos.includes(href)) videos.push(href);
-          return;
+          console.log(`    → Classified as VIDEO`);
         }
       });
 
-      // ── Images: only inside .cPost_contentWrap ───────────────────────────
+      // Images
       $wrap.find('img').each((_, img) => {
         let src = $(img).attr('src') || $(img).attr('data-src') || '';
         if (!src.startsWith('http')) return;
 
         const ext = src.toLowerCase().split('?')[0].slice(-5);
         if (imageExtensions.some(e => ext.endsWith(e))) {
-          // Prefer parent <a> href if it looks like full-res image
           const $parentA = $(img).closest('a[href]');
+          let finalSrc = src;
           if ($parentA.length) {
             const parentHref = $parentA.attr('href')?.trim() || '';
             const parentExt = parentHref.toLowerCase().split('?')[0].slice(-5);
             if (imageExtensions.some(e => parentExt.endsWith(e))) {
-              src = parentHref;
+              finalSrc = parentHref;
             }
           }
-
-          if (!images.includes(src)) {
-            images.push(src);
-            console.log(`Captured image: ${src} (class: ${$(img).attr('class') || 'none'})`);
+          if (!images.includes(finalSrc)) {
+            images.push(finalSrc);
+            console.log(`    → IMAGE captured: ${finalSrc} (class: ${$(img).attr('class') || 'none'})`);
           }
         }
       });
     });
 
-    // ── Final response ───────────────────────────────────────────────────────
+    console.log(`\n[SUMMARY] Videos: ${videos.length} | Images: ${images.length} | Zips: ${zips.length}`);
+
     return res.status(200).json({
       title,
       videos,
@@ -216,7 +217,8 @@ app.post('/api/scrape', async (req: Request, res: Response) => {
       zips
     });
   } catch (error: any) {
-    console.error(`Scrape failed for ${req.body.url}:`, error.message);
+    console.error(`[ERROR] Scrape failed for ${req.body?.url || 'unknown'}:`);
+    console.error(error.stack || error.message);
     return res.status(500).json({
       error: 'Failed to scrape page',
       details: error.message || 'Internal error'
@@ -224,12 +226,21 @@ app.post('/api/scrape', async (req: Request, res: Response) => {
   }
 });
 
-// Health check
+// Health check with debug
 app.get('/health', (req, res) => {
+  console.log('[HEALTH] Check requested');
   res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
 
+// ── Catch-all for unmatched routes (helps diagnose 404) ──────────────────────
+app.use((req: Request, res: Response) => {
+  console.log(`[404 NOT FOUND] ${req.method} ${req.originalUrl} | IP: ${req.ip}`);
+  console.log(`[404] Body was: ${JSON.stringify(req.body, null, 2)}`);
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`POST /api/scrape → { "url": "https://..." }`);
+  console.log(`\nServer running on http://localhost:${PORT}`);
+  console.log('Debug mode enabled — detailed request & extraction logs active');
+  console.log('POST /api/scrape → { "url": "https://..." }\n');
 });
