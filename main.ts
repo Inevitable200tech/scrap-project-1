@@ -52,9 +52,9 @@ async function getPersistentContext() {
 
 // Rate limiting: 10 requests per IP per minute
 const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  message: { error: 'Rate limit exceeded. Please wait 60 seconds.' },
+  windowMs: 60 * 1000,   // still 1 minute
+  max: 60,               // ← allow 1 request per second (60/min)
+  message: { error: 'Rate limit exceeded. Please wait.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
