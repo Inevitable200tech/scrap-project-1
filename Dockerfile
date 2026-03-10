@@ -1,5 +1,5 @@
 # Official Playwright image — updated to 1.57.0
-FROM mcr.microsoft.com/playwright:v1.49.0-noble 
+FROM mcr.microsoft.com/playwright:v1.57.0-jammy 
 # Note: Use 'noble' or 'jammy' - both work, but noble is the latest Ubuntu LTS
 
 # 1. Install Python (Required for yt-dlp) and FFmpeg (for merging video/audio)
