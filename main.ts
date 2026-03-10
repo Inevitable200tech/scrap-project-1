@@ -7,6 +7,7 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import pLimit from 'p-limit'; // Install this: npm install p-limit
 import * as os from 'os';
 import * as path from 'path';
+import fs from 'fs';
 
 const execPromise = promisify(exec);
 playwrightExtra.chromium.use(StealthPlugin());
@@ -38,31 +39,41 @@ app.post('/api/scrape', async (req: Request, res: Response) => {
     console.log(`[DOCKER] Starting scrape for: ${url}`);
     const userDataDir = path.join(os.tmpdir(), 'dropmms-api-profile');
     console.log(`Persistent profile: ${userDataDir}`);
-
+    // CRITICAL FOR DOCKER: Remove old locks that cause silent hangs
+    if (fs.existsSync(path.join(userDataDir, 'SingletonLock'))) {
+      try { fs.unlinkSync(path.join(userDataDir, 'SingletonLock')); } catch { }
+    }
+    console.log(`[DEBUG] Launching persistent browser context at ${userDataDir}`);
     browser = await playwrightExtra.chromium.launchPersistentContext(
       userDataDir,
       {
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-infobars',
-          '--window-size=1280,900',
-          '--disable-blink-features=AutomationControlled',
-        ],
-        viewport: { width: 1280, height: 900 },
-        userAgent:
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        locale: 'en-US',
-        timezoneId: 'Asia/Kolkata',
-        bypassCSP: true,
-        javaScriptEnabled: true,
-        ignoreHTTPSErrors: true,
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--no-zygote',
+        '--disable-setuid-sandbox',
+        '--disable-infobars',
+        '--window-size=1280,900',
+        '--disable-blink-features=AutomationControlled',
+      ],
+      viewport: { width: 1280, height: 900 },
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      timezoneId: 'Asia/Kolkata',
+      bypassCSP: true,
+      javaScriptEnabled: true,
+      ignoreHTTPSErrors: true,
       }
     );
+    console.log(`[DEBUG] Browser context launched successfully`);
 
+    console.log(`[DEBUG] Creating new page`);
     const page = await browser.newPage();
+    console.log(`[DEBUG] Page created, navigating to ${url}`);
     await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+    console.log(`[DEBUG] Page loaded successfully`);
 
     // Smooth scroll to bottom to load lazy images
     await page.evaluate(async () => {
