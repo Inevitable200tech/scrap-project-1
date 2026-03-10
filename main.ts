@@ -5,6 +5,8 @@ import * as cheerio from 'cheerio';
 import playwrightExtra from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import pLimit from 'p-limit'; // Install this: npm install p-limit
+import * as os from 'os';
+import * as path from 'path';
 
 const execPromise = promisify(exec);
 playwrightExtra.chromium.use(StealthPlugin());
@@ -23,7 +25,7 @@ async function getMediaInfo(url: string) {
     const { stdout } = await execPromise(`yt-dlp -j --no-warnings --flat-playlist "${url}"`);
     return JSON.parse(stdout);
   } catch (e) {
-    return null; 
+    return null;
   }
 }
 
@@ -34,20 +36,34 @@ app.post('/api/scrape', async (req: Request, res: Response) => {
   let browser;
   try {
     console.log(`[DOCKER] Starting scrape for: ${url}`);
-    
-    browser = await playwrightExtra.chromium.launch({ 
-      headless: true,
-      args: [
-        '--no-sandbox', 
-        '--disable-setuid-sandbox', 
-        '--disable-dev-shm-usage', // Critical for Docker to prevent /dev/shm crashes
-        '--disable-gpu'
-      ] 
-    });
+    const userDataDir = path.join(os.tmpdir(), 'dropmms-api-profile');
+    console.log(`Persistent profile: ${userDataDir}`);
+
+    browser = await playwrightExtra.chromium.launchPersistentContext(
+      userDataDir,
+      {
+        headless: true,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-infobars',
+          '--window-size=1280,900',
+          '--disable-blink-features=AutomationControlled',
+        ],
+        viewport: { width: 1280, height: 900 },
+        userAgent:
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        locale: 'en-US',
+        timezoneId: 'Asia/Kolkata',
+        bypassCSP: true,
+        javaScriptEnabled: true,
+        ignoreHTTPSErrors: true,
+      }
+    );
 
     const page = await browser.newPage();
     await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
-    
+
     // Smooth scroll to bottom to load lazy images
     await page.evaluate(async () => {
       await new Promise((resolve) => {
@@ -82,7 +98,7 @@ app.post('/api/scrape', async (req: Request, res: Response) => {
     console.log(`[INFO] Found ${linksFound.size} potential links. Checking with yt-dlp...`);
 
     // Use p-limit to check links without crashing the container
-    const checkTasks = Array.from(linksFound).map((link) => 
+    const checkTasks = Array.from(linksFound).map((link) =>
       limit(async () => {
         const info = await getMediaInfo(link);
         if (info) {
