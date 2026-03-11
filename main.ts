@@ -29,6 +29,54 @@ async function getMediaInfo(url: string) {
     return null;
   }
 }
+/**
+ * Filters and de-duplicates video objects found during scraping.
+ * Priority: Removes blacklisted domains, blobs, and redundant HLS playlists.
+ */
+const filterVideoUrls = (videos: any[], originalUrl: string) => {
+  // 1. Extract the main domain from the original URL (e.g., mmsvibe.com)
+  const urlObj = new URL(originalUrl);
+  const mainDomain = urlObj.hostname.split('.').slice(-2).join('.'); 
+
+  const filtered = videos.filter(v => {
+    const vUrl = v.url.toLowerCase();
+    
+    // --- BLACKLISTS ---
+    const isOriginal = v.url === originalUrl;
+    const isBlob = vUrl.startsWith('blob:');
+    // Added common ad-serving domains found in your curl output
+    const isAdDomain = /afcdn\.net|adsystem|clck\.ru|doubleclick|popads|exoclick/i.test(vUrl);
+    const isTracker = /yandex|mc\.ru|analytics|pixel|google|facebook|amazon|\.ts($|\?)/i.test(vUrl);
+    
+    // --- WHITELIST LOGIC ---
+    // A video is likely valid if it contains the site name or doesn't look like an ad library
+    const isLibraryAd = vUrl.includes('/library/') || vUrl.includes('/ads/');
+
+    return !isOriginal && !isBlob && !isAdDomain && !isTracker && !isLibraryAd;
+  });
+
+  // 2. De-duplicate by URL
+  const uniqueMap = new Map();
+  filtered.forEach(v => uniqueMap.set(v.url, v));
+  let uniqueVideos = Array.from(uniqueMap.values());
+
+  // 3. Smart HLS Filtering (Master vs Index)
+  const hasMaster = uniqueVideos.some(v => v.url.includes('master.m3u8'));
+  if (hasMaster) {
+    uniqueVideos = uniqueVideos.filter(v => 
+      v.url.includes('master.m3u8') || !v.url.includes('.m3u8')
+    );
+  }
+
+  // 4. Final fallback: If everything was filtered out but we had results, 
+  // maybe we were too strict. Let's return the first one that wasn't a tracker.
+  if (uniqueVideos.length === 0 && videos.length > 0) {
+      const emergencyBackup = videos.find(v => !/google|analytics|yandex/i.test(v.url));
+      return emergencyBackup ? [emergencyBackup] : [];
+  }
+
+  return uniqueVideos;
+};
 
 app.post('/api/scrape', async (req: Request, res: Response) => {
 
@@ -159,16 +207,12 @@ app.post('/api/scrape', async (req: Request, res: Response) => {
         interceptedVideos.push({ site: 'DOM-Extraction', url: domMedia });
       }
 
-      const title = await page.title();
-      await browser.close();
-
+      const title = await page.title().catch(() => "Unknown Title");
+      if (browser) await browser.close().catch(() => { });
+      const filteredVideos = filterVideoUrls(interceptedVideos, url);
       return {
         title,
-        videos: Array.from(new Map(
-          interceptedVideos
-            .filter(v => v.url !== url && !v.url.startsWith('blob:'))
-            .map(v => [v.url, v])
-        ).values())
+        videos: filteredVideos
       };
 
     } catch (error: any) {
@@ -188,9 +232,9 @@ app.post('/api/scrape', async (req: Request, res: Response) => {
 
     if (result.videos.length === 0) {
       console.log(`[FAILED] [ID: ${streamId}] No videos found after retry.`);
-      return res.status(202).json({ 
+      return res.status(202).json({
         error: 'No videos found. Please try again later.',
-        retryAfter: 300 
+        retryAfter: 300
       });
     }
 
@@ -213,5 +257,5 @@ app.get('/health', (req: Request, res: Response) => {
 const PORT = parseInt(process.env.PORT || '3000', 10);
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 Server running in Docker on port ${PORT}`);
-  console.log(`Using yt-dlp for universal video extraction\n`);
+  console.log(`Using yt-dlp and playwright for universal video extraction\n`);
 });
