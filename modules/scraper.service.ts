@@ -3,63 +3,141 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { BROWSER_ARGS } from './config.js';
 import { filterVideoUrls } from './utils.js';
 
 playwrightExtra.chromium.use(StealthPlugin());
 
 export async function performScrape(url: string, streamId: string) {
-  const userDataDir = path.join(os.tmpdir(), 'dropmms-api-profile');
-  if (fs.existsSync(path.join(userDataDir, 'SingletonLock'))) {
-    try { fs.unlinkSync(path.join(userDataDir, 'SingletonLock')); } catch { }
-  }
-
-  const browser = await playwrightExtra.chromium.launchPersistentContext(userDataDir, {
-    headless: true,
-    args: BROWSER_ARGS,
-    viewport: { width: 1280, height: 900 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36...',
-  });
-
+  let browser;
   try {
+    console.log(`[START] [ID: ${streamId}] Scrape Target: ${url}`);
+
+    const userDataDir = path.join(os.tmpdir(), 'dropmms-api-profile');
+
+    if (fs.existsSync(path.join(userDataDir, 'SingletonLock'))) {
+      try { fs.unlinkSync(path.join(userDataDir, 'SingletonLock')); } catch { }
+    }
+
+    browser = await playwrightExtra.chromium.launchPersistentContext(userDataDir, {
+      headless: true,
+      args: [
+        '--no-sandbox', '--disable-dev-shm-usage', '--no-zygote',
+        '--disable-setuid-sandbox', '--disable-infobars', '--window-size=1280,900',
+        '--disable-blink-features=AutomationControlled',
+      ],
+      viewport: { width: 1280, height: 900 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    });
+
     const page = await browser.newPage();
     const interceptedVideos: any[] = [];
 
-    // Popup killer
+    // --- FIXED POPUP KILLER ---
     browser.on('page', async popup => {
-      await new Promise(r => setTimeout(r, 8000));
-      if (!popup.isClosed()) await popup.close().catch(() => { });
+      try {
+        // Give stealth plugin 1-2 seconds to finish initializing before closing
+        await new Promise(resolve => setTimeout(resolve, 8000));
+        if (!popup.isClosed()) {
+          await popup.close().catch(() => { });
+        }
+      } catch (e) {
+        // Ignore errors if the popup was already closed
+      }
     });
 
+    // Network Sniffer
     page.on('request', request => {
       const reqUrl = request.url();
-      if (!/yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)/i.test(reqUrl) && 
-          (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4'))) {
+      const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)/i.test(reqUrl);
+
+      if (!isBlacklisted && (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4'))) {
         if (reqUrl !== url && !interceptedVideos.some(v => v.url === reqUrl)) {
-          interceptedVideos.push({ site: 'Sniffer', url: reqUrl });
+          console.log(`[CATCH] [ID: ${streamId}] Found: ${reqUrl.substring(0, 60)}...`);
+          interceptedVideos.push({ site: 'Network-Sniffer', url: reqUrl });
         }
       }
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => { });
 
-    // Site Specific Strategies
-    if (/vidara\.|vidnest\./i.test(url)) {
-      await page.click('.jw-video, video', { force: true }).catch(() => { });
-    } else if (/vidsonic\./i.test(url)) {
-      await page.click('.vjs-big-play-button', { force: true }).catch(() => { });
+    const isVidara = /vidara\./i.test(url);
+    const isVidsonic = /vidsonic\./i.test(url);
+    const isVidnest = /vidnest\./i.test(url);
+
+    // --- Site Specific Strategies ---
+    if (isVidara || isVidnest) {
+      console.log(`[DEBUG] [ID: ${streamId}] Strategy: VIDARA (JWPlayer)`);
+      const vidaraPlay = '.jw-video, .jw-display-icon-container, video';
+      await page.click(vidaraPlay, { force: true }).catch(() => { });
+      await page.waitForTimeout(2000);
+
+      const jwSource = await page.evaluate(() => {
+        try {
+          const player = (window as any).jwplayer?.();
+          return player ? player.getPlaylist()?.[0]?.file : null;
+        } catch { return null; }
+      });
+      if (jwSource) interceptedVideos.push({ site: 'JW-Internal', url: jwSource });
+
+    } else if (isVidsonic) {
+      console.log(`[DEBUG] [ID: ${streamId}] Strategy: VIDSONIC (Video.js)`);
+      await page.evaluate(() => {
+        document.querySelector('.vjs-vast-label')?.remove();
+      });
+      const vjsPlay = '.vjs-big-play-button, .vjs-play-control';
+      await page.click(vjsPlay, { force: true }).catch(() => { });
+      await page.waitForTimeout(2000);
+
+      const vjsSource = await page.evaluate(() => {
+        try {
+          const playerEl = document.querySelector('.video-js');
+          if (playerEl && (playerEl as any).player) return (playerEl as any).player.src();
+          if ((window as any).videojs) {
+            const players = (window as any).videojs.getPlayers();
+            return Object.values(players)[0] ? (Object.values(players)[0] as any).src() : null;
+          }
+        } catch { return null; }
+      });
+      if (vjsSource && !vjsSource.startsWith('blob:')) interceptedVideos.push({ site: 'VJS-Internal', url: vjsSource });
+
     } else {
-      await page.click('.plyr__control--overlaid, .play-overlay', { force: true }).catch(() => { });
+      console.log(`[DEBUG] [ID: ${streamId}] Strategy: GENERAL/STREAMTAPE`);
+      try {
+        const playBtn = '.plyr__control--overlaid, .play-overlay, button[data-plyr="play"]';
+        await page.waitForSelector(playBtn, { timeout: 10000 });
+        await page.click(playBtn, { force: true });
+        await page.waitForTimeout(1500);
+        await page.evaluate((sel) => {
+          const btn = document.querySelector(sel) as HTMLElement;
+          if (btn) btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }, playBtn);
+      } catch (err) { }
     }
 
-    await page.waitForTimeout(3000);
-    const title = await page.title().catch(() => "Unknown");
+    // Fallback: DOM Extraction
+    const domMedia = await page.evaluate(() => {
+      const v = document.querySelector('video') as HTMLVideoElement;
+      if (!v) return null;
+      const src = v.currentSrc || v.src;
+      return (src && !src.startsWith('blob:')) ? src : null;
+    });
+
+    if (domMedia && !interceptedVideos.some(v => v.url === domMedia)) {
+      interceptedVideos.push({ site: 'DOM-Extraction', url: domMedia });
+    }
+
+    const title = await page.title().catch(() => "Unknown Title");
     
+    if (browser) await browser.close().catch(() => { });
+    
+    const filteredVideos = filterVideoUrls(interceptedVideos, url);
     return {
       title,
-      videos: filterVideoUrls(interceptedVideos, url)
+      videos: filteredVideos
     };
-  } finally {
-    await browser.close().catch(() => { });
+
+  } catch (error: any) {
+    if (browser) await browser.close().catch(() => {});
+    throw error;
   }
 }

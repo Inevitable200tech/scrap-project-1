@@ -1,5 +1,7 @@
 import express from 'express';
 import pLimit from 'p-limit';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { performScrape } from './modules/scraper.service.js';
 import { processAndStoreVideo, getDb, s3Client } from './modules/storage.service.js';
 import { GetObjectCommand } from "@aws-sdk/client-s3";
@@ -8,18 +10,39 @@ import { PORT, CONCURRENCY_LIMIT, R2_CONFIG } from './modules/config.js';
 
 const app = express();
 app.use(express.json());
+
+// --- FRONTEND SETUP ---
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Serve static files from the 'public' folder
+app.use(express.static(path.join(__dirname, '../public')));
+
 const limit = pLimit(CONCURRENCY_LIMIT);
 
-// Endpoint to view and play all processed videos
+// API to list videos with temporary playable links
 app.get('/api/videos', async (req, res) => {
   try {
     const db = await getDb();
-    const videos = await db.collection('videos').find().sort({ processedAt: -1 }).toArray();
+    // Get last 50 videos
+    const videos = await db.collection('videos')
+      .find()
+      .sort({ processedAt: -1 })
+      .limit(50)
+      .toArray();
 
     const playableVideos = await Promise.all(videos.map(async (video) => {
-      const command = new GetObjectCommand({ Bucket: R2_CONFIG.bucket, Key: video.r2Key });
-      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
-      return { ...video, playUrl: signedUrl };
+      try {
+        const command = new GetObjectCommand({ 
+          Bucket: R2_CONFIG.bucket, 
+          Key: video.r2Key 
+        });
+        // Generate a link that works for 1 hour
+        const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+        return { ...video, playUrl: signedUrl };
+      } catch (err) {
+        return { ...video, playUrl: null, error: "Link generation failed" };
+      }
     }));
 
     res.json(playableVideos);
@@ -28,6 +51,7 @@ app.get('/api/videos', async (req, res) => {
   }
 });
 
+// Main Scraper Endpoint
 app.post('/api/scrape', async (req, res) => {
   const { url, title } = req.body;
   if (!url || /luluvdo|luluvid/i.test(url)) {
@@ -39,8 +63,8 @@ app.post('/api/scrape', async (req, res) => {
   try {
     let result = await limit(() => performScrape(url, streamId));
 
-    // Retry after 60s if no videos found
     if (result.videos.length === 0) {
+      console.log(`[RETRY] No videos found for ${streamId}, waiting 60s...`);
       await new Promise(r => setTimeout(r, 60000));
       result = await limit(() => performScrape(url, streamId));
     }
@@ -49,7 +73,6 @@ app.post('/api/scrape', async (req, res) => {
       return res.status(202).json({ error: 'No videos found', retryAfter: 300 });
     }
 
-    // Process and store the first found video
     const storageResult = await processAndStoreVideo(result.videos[0].url, title || result.title);
 
     res.status(storageResult.success ? 200 : 304).json({
@@ -61,4 +84,9 @@ app.post('/api/scrape', async (req, res) => {
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`🚀 API ready on port ${PORT}`));
+// Serve the dashboard HTML for any other route
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../public/index.html'));
+});
+
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running at http://localhost:${PORT}`));
