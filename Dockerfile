@@ -30,6 +30,8 @@ RUN npm install
 
 COPY --from=builder /app/dist ./dist
 
+COPY --from=builder /app/public ./public
+
 # Create the profile directory used in config.ts
 RUN mkdir -p /tmp/scraper-profile && chmod -R 777 /tmp/scraper-profile
 
