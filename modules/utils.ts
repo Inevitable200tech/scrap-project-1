@@ -1,23 +1,18 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
-const execPromise = promisify(exec);
-
-export async function getMediaInfo(url: string) {
-  try {
-    const { stdout } = await execPromise(`yt-dlp -j --no-warnings --flat-playlist "${url}"`);
-    return JSON.parse(stdout);
-  } catch { return null; }
-}
+import { URL } from 'url';
 
 export const filterVideoUrls = (videos: any[], originalUrl: string) => {
+  const urlObj = new URL(originalUrl);
+  const mainDomain = urlObj.hostname.split('.').slice(-2).join('.'); 
+
   const filtered = videos.filter(v => {
     const vUrl = v.url.toLowerCase();
     const isOriginal = v.url === originalUrl;
     const isBlob = vUrl.startsWith('blob:');
     const isAdDomain = /afcdn\.net|adsystem|clck\.ru|doubleclick|popads|exoclick/i.test(vUrl);
     const isTracker = /yandex|mc\.ru|analytics|pixel|google|facebook|amazon|\.ts($|\?)/i.test(vUrl);
-    
-    return !isOriginal && !isBlob && !isAdDomain && !isTracker;
+    const isLibraryAd = vUrl.includes('/library/') || vUrl.includes('/ads/');
+
+    return !isOriginal && !isBlob && !isAdDomain && !isTracker && !isLibraryAd;
   });
 
   const uniqueMap = new Map();
@@ -26,7 +21,15 @@ export const filterVideoUrls = (videos: any[], originalUrl: string) => {
 
   const hasMaster = uniqueVideos.some(v => v.url.includes('master.m3u8'));
   if (hasMaster) {
-    uniqueVideos = uniqueVideos.filter(v => v.url.includes('master.m3u8') || !v.url.includes('.m3u8'));
+    uniqueVideos = uniqueVideos.filter(v => 
+      v.url.includes('master.m3u8') || !v.url.includes('.m3u8')
+    );
+  }
+
+  // Emergency fallback
+  if (uniqueVideos.length === 0 && videos.length > 0) {
+    const emergencyBackup = videos.find(v => !/google|analytics|yandex/i.test(v.url));
+    return emergencyBackup ? [emergencyBackup] : [];
   }
 
   return uniqueVideos;
