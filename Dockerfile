@@ -10,6 +10,8 @@ COPY . .
 # Compiles TS to JS (assumes you have a 'build' script in package.json)
 RUN npm run build 
 
+RUN ls -la && ls -la public/
+
 # --- Stage 2: Production ---
 FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
