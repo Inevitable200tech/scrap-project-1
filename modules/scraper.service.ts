@@ -61,9 +61,9 @@ export async function performScrape(url: string, streamId: string) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => { });
 
     const isVidara = /vidara\./i.test(url);
-    const isVidsonic = /vidsonic\./i.test(url);
     const isVidnest = /vidnest\./i.test(url);
-
+    // Updated to catch both vidsonic.xxx and vsonic.xxx
+    const isVidsonic = /vidsonic\.|vsonic\./i.test(url);
     // --- Site Specific Strategies ---
     if (isVidara || isVidnest) {
       console.log(`[DEBUG] [ID: ${streamId}] Strategy: VIDARA (JWPlayer)`);
@@ -127,9 +127,9 @@ export async function performScrape(url: string, streamId: string) {
     }
 
     const title = await page.title().catch(() => "Unknown Title");
-    
+
     if (browser) await browser.close().catch(() => { });
-    
+
     const filteredVideos = filterVideoUrls(interceptedVideos, url);
     return {
       title,
@@ -137,7 +137,7 @@ export async function performScrape(url: string, streamId: string) {
     };
 
   } catch (error: any) {
-    if (browser) await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => { });
     throw error;
   }
 }
