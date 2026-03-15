@@ -8,23 +8,22 @@ import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { PORT, CONCURRENCY_LIMIT, R2_CONFIG } from './modules/config.js';
 
+// Define the interface to fix the "type never" and "void" errors
+interface ScrapeResult {
+  title: string;
+  videos: { site: string; url: string }[];
+}
+
 const app = express();
 app.use(express.json());
 
-// --- FRONTEND SETUP ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Serve static files from the 'public' folder
 app.use(express.static(path.join(__dirname, '../public')));
 
 const limit = pLimit(CONCURRENCY_LIMIT);
 
-// API to list videos with temporary playable links
-// Add this near your other routes in main.ts
-
-// Main Scraper Endpoint
-app.post('/api/scrape', async (req, res) => {
+app.post('/api/scrape', async (req, res): Promise<any> => {
   const { url, title } = req.body;
   if (!url || /luluvdo|luluvid/i.test(url)) {
     return res.status(400).json({ error: 'URL required or provider not supported' });
@@ -33,18 +32,20 @@ app.post('/api/scrape', async (req, res) => {
   const streamId = url.split('/v/')[1]?.split('/')[0] || Math.random().toString(36).substring(7);
 
   try {
-    let result = await limit(() => performScrape(url, streamId));
+    // Cast the result to ScrapeResult to satisfy the compiler
+    let result = await limit(() => performScrape(url, streamId)) as ScrapeResult;
 
-    if (result.videos.length === 0) {
+    if (!result || !result.videos || result.videos.length === 0) {
       console.log(`[RETRY] No videos found for ${streamId}, waiting 60s...`);
       await new Promise(r => setTimeout(r, 60000));
-      result = await limit(() => performScrape(url, streamId));
+      result = await limit(() => performScrape(url, streamId)) as ScrapeResult;
     }
 
-    if (result.videos.length === 0) {
+    if (!result || !result.videos || result.videos.length === 0) {
       return res.status(202).json({ error: 'No videos found', retryAfter: 300 });
     }
 
+    // Now compiler knows result.videos[0].url exists
     const storageResult = await processAndStoreVideo(result.videos[0].url, title || result.title);
 
     res.status(storageResult.success ? 200 : 304).json({
