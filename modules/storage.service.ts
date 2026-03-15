@@ -44,24 +44,38 @@ export async function processAndStoreVideo(videoUrl: string, title: string): Pro
     let videoSource: Readable;
 
     if (isM3U8) {
-      console.log(`[STORAGE] HLS detected. Starting FFmpeg: ${videoUrl}`);
+      console.log(`[STORAGE] HLS detected. Shrinking to 480p (Ultrafast): ${videoUrl}`);
       ffmpegProcess = spawn('ffmpeg', [
         '-i', videoUrl,
-        '-c', 'copy',
-        '-bsf:a', 'aac_adtstoasc',
-        // 'default_base_moof' helps with fragmented mp4 playback
+        '-vf', 'scale=-2:480',           // Downscale to 480p
+        '-r', '20',                      // Slightly smoother 20fps
+        '-c:v', 'libx264',
+        '-crf', '32',                    // High compression (lower quality)
+        '-preset', 'ultrafast',          // Minimum CPU usage
+        '-b:v', '500k',                  // Cap video bitrate at 500kbps
+        '-maxrate', '600k',
+        '-bufsize', '1000k',
+        '-c:a', 'aac',
+        '-b:a', '64k',                   // Low audio quality
+        '-ac', '1',                      // Mono audio to save space
         '-movflags', 'frag_keyframe+empty_moov+default_base_moof', 
         '-f', 'mp4',
         'pipe:1'
       ]);
       videoSource = ffmpegProcess.stdout;
     } else {
-      console.log(`[STORAGE] Direct link detected. Processing for FastStart: ${videoUrl}`);
-      // Pass direct MP4s through FFmpeg to move metadata to the front (FastStart)
-      // and ensure the stream is correctly formatted for R2 streaming.
+      console.log(`[STORAGE] Direct link detected. Shrinking to 480p (Ultrafast): ${videoUrl}`);
       ffmpegProcess = spawn('ffmpeg', [
         '-i', videoUrl,
-        '-c', 'copy', 
+        '-vf', 'scale=-2:480',
+        '-r', '20',
+        '-c:v', 'libx264',
+        '-crf', '32',
+        '-preset', 'ultrafast',
+        '-b:v', '500k',
+        '-c:a', 'aac',
+        '-b:a', '64k',
+        '-ac', '1',
         '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
         '-f', 'mp4',
         'pipe:1'
