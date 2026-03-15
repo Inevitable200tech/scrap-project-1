@@ -28,11 +28,16 @@ app.post('/api/login', (req, res) => {
   const { pin } = req.body;
   const correctPin = process.env.DASHBOARD_PIN;
 
+  // Debugging: This will show in Render logs what the server is comparing
+  // Delete these logs once you confirm it works!
+  console.log(`[AUTH] Received: "${pin}" | Expected: "${correctPin}"`);
+
   if (!correctPin) {
-    return res.status(500).json({ error: "Server PIN not configured" });
+    console.error("[AUTH ERROR] DASHBOARD_PIN is not set in Environment Variables!");
+    return res.status(500).json({ error: "Server configuration error" });
   }
 
-  if (pin === correctPin) {
+  if (String(pin).trim() === String(correctPin).trim()) {
     res.json({ success: true });
   } else {
     res.status(401).json({ error: "Invalid PIN" });
@@ -49,17 +54,31 @@ app.get('/api/videos', async (req, res) => {
 
   try {
     const db = await getDb();
-    const videos = await db.collection('videos').find().sort({ processedAt: -1 }).limit(50).toArray();
+    const videos = await db.collection('videos')
+      .find()
+      .sort({ processedAt: -1 })
+      .limit(50)
+      .toArray();
+
+    // If no videos, return empty array immediately
+    if (!videos || videos.length === 0) {
+      return res.json([]);
+    }
 
     const playableVideos = await Promise.all(videos.map(async (video) => {
-      const command = new GetObjectCommand({ Bucket: R2_CONFIG.bucket, Key: video.r2Key });
-      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
-      return { ...video, playUrl: signedUrl };
+      try {
+        const command = new GetObjectCommand({ Bucket: R2_CONFIG.bucket, Key: video.r2Key });
+        const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+        return { ...video, playUrl: signedUrl };
+      } catch (e) {
+        return { ...video, playUrl: null, error: "Link failed" };
+      }
     }));
 
     res.json(playableVideos);
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    console.error("[API ERROR]", error);
+    res.status(500).json({ error: error.message }); // This returns an OBJECT, which causes the .forEach error
   }
 });
 

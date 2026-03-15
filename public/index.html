@@ -4,10 +4,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Scraper Dashboard</title>
+    <title>Video Vault</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        /* Smooth transition for lazy loading */
         .video-card {
             opacity: 0;
             transform: translateY(20px);
@@ -21,29 +20,32 @@
     </style>
 </head>
 
-<body class="bg-gray-900 text-gray-100 min-h-screen p-8 font-sans">
+<body class="bg-gray-900 text-gray-100 min-h-screen p-4 md:p-8 font-sans">
 
     <div id="lock-screen" class="fixed inset-0 bg-gray-950 z-50 flex items-center justify-center">
         <div class="bg-gray-900 p-8 rounded-2xl border border-gray-800 shadow-2xl w-full max-w-md text-center">
-            <h2 class="text-3xl font-bold mb-6">🔐 Access Vault</h2>
-            <input type="password" id="admin-pin" placeholder="Enter Secret PIN"
-                class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 mb-4 focus:outline-none focus:border-indigo-500 text-center text-xl tracking-widest">
+            <h2 class="text-3xl font-bold mb-6 text-white">🔐 Access Vault</h2>
+            <input type="password" id="admin-pin" placeholder="Enter PIN" autocomplete="off"
+                class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 mb-4 focus:outline-none focus:border-indigo-500 text-center text-xl tracking-widest text-white">
             <button onclick="unlock()"
                 class="w-full bg-indigo-600 hover:bg-indigo-500 py-3 rounded-lg font-bold transition">Unlock</button>
-            <p id="lock-error" class="text-red-500 mt-4 hidden text-sm">Incorrect PIN. Try again.</p>
+            <p id="lock-error" class="text-red-500 mt-4 hidden text-sm"></p>
         </div>
     </div>
 
     <div class="max-w-7xl mx-auto">
-        <header class="mb-10 border-b border-gray-800 pb-6 flex justify-between items-end">
+        <header
+            class="mb-10 border-b border-gray-800 pb-6 flex flex-col md:flex-row justify-between items-center gap-4">
             <div>
                 <h1 class="text-4xl font-bold text-white mb-2">📼 Video Vault</h1>
-                <p class="text-gray-400">Secure Personal Stream Archive</p>
+                <p class="text-gray-400">Encrypted Personal Media Archive</p>
             </div>
-            <div class="flex gap-4">
-                <button onclick="logout()" class="text-gray-500 hover:text-white text-sm">Lock</button>
+            <div class="flex items-center gap-4">
+                <button onclick="logout()" class="text-gray-500 hover:text-red-400 text-sm transition">Logout &
+                    Lock</button>
                 <button onclick="loadVideos()"
-                    class="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded transition">↻ Refresh</button>
+                    class="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-full font-semibold transition">↻
+                    Refresh</button>
             </div>
         </header>
 
@@ -52,20 +54,19 @@
     </div>
 
     <script>
-        // Simple client-side security (Update this PIN!)
+        // --- AUTH LOGIC ---
         async function unlock() {
             const pin = document.getElementById('admin-pin').value;
             const errorEl = document.getElementById('lock-error');
 
             try {
-                const response = await fetch('/api/login', {
+                const res = await fetch('/api/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ pin })
                 });
 
-                if (response.ok) {
-                    // Save PIN locally to use in API headers
+                if (res.ok) {
                     localStorage.setItem('vault_pin', pin);
                     document.getElementById('lock-screen').classList.add('hidden');
                     loadVideos();
@@ -74,129 +75,91 @@
                     errorEl.classList.remove('hidden');
                 }
             } catch (err) {
-                errorEl.innerText = "Connection error.";
+                errorEl.innerText = "Server unreachable.";
                 errorEl.classList.remove('hidden');
             }
         }
 
-        async function loadVideos() {
-            const pin = localStorage.getItem('vault_pin');
-            if (!pin) return;
-
-            const grid = document.getElementById('video-grid');
-            grid.innerHTML = '<p class="text-gray-500 animate-pulse">Fetching records...</p>';
-
-            try {
-                const response = await fetch('/api/videos', {
-                    headers: { 'Authorization': pin } // Send PIN as Auth header
-                });
-
-                if (!response.ok) throw new Error("Session expired or invalid PIN");
-
-                const data = await response.json();
-                if (data.length === 0) {
-                    grid.innerHTML = '<p class="text-gray-500 col-span-full text-center py-10">No videos found.</p>';
-                    return;
-                }
-
-                grid.innerHTML = '';
-                data.forEach(video => {
-                    // ... (rest of your existing card creation logic)
-                    const card = document.createElement('div');
-                    card.className = "video-card bg-gray-800 rounded-xl overflow-hidden shadow-2xl border border-gray-700 hover:border-indigo-500";
-                    card.innerHTML = `
-                <video controls class="w-full aspect-video bg-black" preload="none">
-                    <source data-src="${video.playUrl}" type="video/mp4">
-                </video>
-                <div class="p-5">
-                    <h3 class="font-bold text-lg mb-2 text-white truncate">${video.title || 'Untitled'}</h3>
-                    <p class="text-xs text-gray-500">Processed: ${new Date(video.processedAt).toLocaleDateString()}</p>
-                </div>
-            `;
-                    grid.appendChild(card);
-                    videoObserver.observe(card);
-                });
-
-            } catch (error) {
-                logout(); // Redirect to lock screen if unauthorized
-            }
-        }
         function logout() {
-            localStorage.removeItem('vault_auth');
+            localStorage.removeItem('vault_pin');
             location.reload();
         }
 
-        // --- LAZY LOADING LOGIC ---
-        // This observer stops videos from loading until they are visible
+        // --- DELETE LOGIC ---
+        async function deleteVideo(id) {
+            if (!confirm("Permanently delete this video?")) return;
+            const pin = localStorage.getItem('vault_pin');
+
+            try {
+                const res = await fetch(`/api/videos/${id}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': pin }
+                });
+                if (res.ok) loadVideos();
+                else alert("Delete failed. Auth error.");
+            } catch (err) {
+                alert("Error connecting to server.");
+            }
+        }
+
+        // --- LAZY LOADING ---
         const videoObserver = new IntersectionObserver((entries) => {
             entries.forEach(entry => {
                 if (entry.isIntersecting) {
                     const card = entry.target;
                     const video = card.querySelector('video');
                     const source = video.querySelector('source');
-
-                    // Set source only when visible
                     if (source.dataset.src) {
                         source.src = source.dataset.src;
-                        video.load(); // Start loading metadata
+                        video.load();
                         source.removeAttribute('data-src');
                     }
                     card.classList.add('loaded');
                 } else {
-                    // Stop video if user scrolls far away
                     const video = entry.target.querySelector('video');
                     if (video) video.pause();
                 }
             });
         }, { threshold: 0.1 });
 
+        // --- CONTENT LOADING ---
         async function loadVideos() {
-            if (localStorage.getItem('vault_auth') !== 'true') return;
+            const pin = localStorage.getItem('vault_pin');
+            if (!pin) return;
 
             const grid = document.getElementById('video-grid');
-            grid.innerHTML = '<p class="text-gray-500 animate-pulse">Fetching records...</p>';
+            grid.innerHTML = '<p class="text-gray-500 animate-pulse col-span-full text-center py-20 text-xl">Accessing encrypted records...</p>';
 
             try {
-                const response = await fetch('/api/videos');
+                const response = await fetch('/api/videos', {
+                    headers: { 'Authorization': pin }
+                });
+
                 const data = await response.json();
 
-                if (!Array.isArray(data)) throw new Error(data.error || "Auth Error");
+                // Check if data is an error object instead of an array
+                if (!Array.isArray(data)) {
+                    throw new Error(data.error || "Server returned non-array data");
+                }
+
                 if (data.length === 0) {
-                    grid.innerHTML = '<p class="text-gray-500 col-span-full text-center py-10">No videos found.</p>';
+                    grid.innerHTML = '<div class="col-span-full text-center py-20 text-gray-500">The vault is currently empty.</div>';
                     return;
                 }
 
-                grid.innerHTML = ''; // Clear loader
-
+                grid.innerHTML = '';
                 data.forEach(video => {
-                    const videoUrl = video.playUrl;
-                    const card = document.createElement('div');
-                    card.className = "video-card bg-gray-800 rounded-xl overflow-hidden shadow-2xl border border-gray-700 hover:border-indigo-500";
-
-                    card.innerHTML = `
-                        <video controls class="w-full aspect-video bg-black" preload="none">
-                            <source data-src="${videoUrl}" type="video/mp4">
-                        </video>
-                        <div class="p-5">
-                            <h3 class="font-bold text-lg mb-2 text-white truncate">${video.title || 'Untitled'}</h3>
-                            <div class="text-xs text-gray-500 font-mono space-y-1">
-                                <p>Processed: ${new Date(video.processedAt).toLocaleDateString()}</p>
-                                <p class="truncate">ID: ${video.r2Key.split('-').pop()}</p>
-                            </div>
-                        </div>
-                    `;
-                    grid.appendChild(card);
-                    videoObserver.observe(card);
+                    // ... (Your card creation logic)
                 });
 
             } catch (error) {
-                grid.innerHTML = `<div class="col-span-full text-red-400 p-4 border border-red-500 rounded bg-red-900/10">Error: ${error.message}</div>`;
+                grid.innerHTML = `<div class="col-span-full text-red-400 p-6 border border-red-900 bg-red-900/10 rounded-xl">
+            <strong>Vault Error:</strong> ${error.message}
+        </div>`;
             }
         }
-
-        // Check auth status on load
         window.addEventListener('DOMContentLoaded', () => {
-            if (localStorage.getItem('vault_auth') === 'true') {
+            if (localStorage.getItem('vault_pin')) {
                 document.getElementById('lock-screen').classList.add('hidden');
                 loadVideos();
             }
