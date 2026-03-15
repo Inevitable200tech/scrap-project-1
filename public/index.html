@@ -1,56 +1,41 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Video Vault</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        .video-card {
-            opacity: 0;
-            transform: translateY(20px);
-            transition: all 0.5s ease-out;
-        }
-
-        .video-card.loaded {
-            opacity: 1;
-            transform: translateY(0);
-        }
+        .video-card { opacity: 0; transform: translateY(20px); transition: all 0.5s ease-out; }
+        .video-card.loaded { opacity: 1; transform: translateY(0); }
     </style>
 </head>
-
 <body class="bg-gray-900 text-gray-100 min-h-screen p-4 md:p-8 font-sans">
-
+    
     <div id="lock-screen" class="fixed inset-0 bg-gray-950 z-50 flex items-center justify-center">
         <div class="bg-gray-900 p-8 rounded-2xl border border-gray-800 shadow-2xl w-full max-w-md text-center">
             <h2 class="text-3xl font-bold mb-6 text-white">🔐 Access Vault</h2>
             <input type="password" id="admin-pin" placeholder="Enter PIN" autocomplete="off"
-                class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 mb-4 focus:outline-none focus:border-indigo-500 text-center text-xl tracking-widest text-white">
-            <button onclick="unlock()"
-                class="w-full bg-indigo-600 hover:bg-indigo-500 py-3 rounded-lg font-bold transition">Unlock</button>
+                   class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 mb-4 focus:outline-none focus:border-indigo-500 text-center text-xl tracking-widest text-white">
+            <button onclick="unlock()" class="w-full bg-indigo-600 hover:bg-indigo-500 py-3 rounded-lg font-bold transition">Unlock</button>
             <p id="lock-error" class="text-red-500 mt-4 hidden text-sm"></p>
         </div>
     </div>
 
     <div class="max-w-7xl mx-auto">
-        <header
-            class="mb-10 border-b border-gray-800 pb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+        <header class="mb-10 border-b border-gray-800 pb-6 flex flex-col md:flex-row justify-between items-center gap-4">
             <div>
                 <h1 class="text-4xl font-bold text-white mb-2">📼 Video Vault</h1>
                 <p class="text-gray-400">Encrypted Personal Media Archive</p>
             </div>
             <div class="flex items-center gap-4">
-                <button onclick="logout()" class="text-gray-500 hover:text-red-400 text-sm transition">Logout &
-                    Lock</button>
-                <button onclick="loadVideos()"
-                    class="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-full font-semibold transition">↻
-                    Refresh</button>
+                <button onclick="logout()" class="text-gray-500 hover:text-red-400 text-sm transition">Logout & Lock</button>
+                <button onclick="loadVideos()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-full font-semibold transition">↻ Refresh</button>
             </div>
         </header>
 
         <div id="video-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 pb-20">
-        </div>
+            </div>
     </div>
 
     <script>
@@ -58,7 +43,7 @@
         async function unlock() {
             const pin = document.getElementById('admin-pin').value;
             const errorEl = document.getElementById('lock-error');
-
+            
             try {
                 const res = await fetch('/api/login', {
                     method: 'POST',
@@ -117,7 +102,7 @@
                     card.classList.add('loaded');
                 } else {
                     const video = entry.target.querySelector('video');
-                    if (video) video.pause();
+                    if(video) video.pause();
                 }
             });
         }, { threshold: 0.1 });
@@ -126,7 +111,7 @@
         async function loadVideos() {
             const pin = localStorage.getItem('vault_pin');
             if (!pin) return;
-
+            
             const grid = document.getElementById('video-grid');
             grid.innerHTML = '<p class="text-gray-500 animate-pulse col-span-full text-center py-20 text-xl">Accessing encrypted records...</p>';
 
@@ -135,29 +120,50 @@
                     headers: { 'Authorization': pin }
                 });
 
-                const data = await response.json();
-
-                // Check if data is an error object instead of an array
-                if (!Array.isArray(data)) {
-                    throw new Error(data.error || "Server returned non-array data");
+                if (response.status === 403 || response.status === 401) {
+                    logout();
+                    return;
                 }
-
+                
+                const data = await response.json();
                 if (data.length === 0) {
                     grid.innerHTML = '<div class="col-span-full text-center py-20 text-gray-500">The vault is currently empty.</div>';
                     return;
                 }
 
-                grid.innerHTML = '';
+                grid.innerHTML = ''; 
                 data.forEach(video => {
-                    // ... (Your card creation logic)
+                    const card = document.createElement('div');
+                    card.className = "video-card bg-gray-800 rounded-xl overflow-hidden shadow-2xl border border-gray-700 hover:border-indigo-500 relative group";
+                    
+                    card.innerHTML = `
+                        <button onclick="deleteVideo('${video._id}')" 
+                                class="absolute top-2 right-2 z-10 bg-red-600/80 hover:bg-red-600 text-white p-2 rounded-full opacity-0 group-hover:opacity-100 transition duration-200"
+                                title="Delete Video">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
+                        </button>
+                        <video controls class="w-full aspect-video bg-black" preload="none">
+                            <source data-src="${video.playUrl}" type="video/mp4">
+                        </video>
+                        <div class="p-4">
+                            <h3 class="font-bold text-white truncate text-sm md:text-base mb-1" title="${video.title}">${video.title || 'Untitled'}</h3>
+                            <div class="flex justify-between items-center text-[10px] uppercase tracking-wider text-gray-500">
+                                <span>${new Date(video.processedAt).toLocaleDateString()}</span>
+                                <span class="bg-gray-900 px-2 py-0.5 rounded border border-gray-700">${video.type || 'MP4'}</span>
+                            </div>
+                        </div>
+                    `;
+                    grid.appendChild(card);
+                    videoObserver.observe(card);
                 });
 
             } catch (error) {
-                grid.innerHTML = `<div class="col-span-full text-red-400 p-6 border border-red-900 bg-red-900/10 rounded-xl">
-            <strong>Vault Error:</strong> ${error.message}
-        </div>`;
+                grid.innerHTML = `<div class="col-span-full text-red-400 p-6 border border-red-900 bg-red-900/10 rounded-xl">Connection Error: ${error.message}</div>`;
             }
         }
+
         window.addEventListener('DOMContentLoaded', () => {
             if (localStorage.getItem('vault_pin')) {
                 document.getElementById('lock-screen').classList.add('hidden');
@@ -166,5 +172,4 @@
         });
     </script>
 </body>
-
 </html>
