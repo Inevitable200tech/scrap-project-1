@@ -3,23 +3,17 @@ FROM mcr.microsoft.com/playwright:v1.57.0-jammy AS builder
 
 WORKDIR /app
 
-# Copy dependency files first for caching
 COPY package*.json ./
 RUN npm install
 
-# Copy EVERYTHING from your root (including public/)
 COPY . .
-
-# VERIFICATION: List files to ensure 'public' is inside the builder
-RUN ls -la /app && ls -la /app/public
-
-# Build the project
+# Compiles TS to JS (assumes you have a 'build' script in package.json)
 RUN npm run build 
 
 # --- Stage 2: Production ---
 FROM mcr.microsoft.com/playwright:v1.57.0-jammy
 
-# Environment setup
+# Install FFmpeg and Python for the production environment
 RUN apt-get update && apt-get install -y \
     python3 \
     ffmpeg \
@@ -30,18 +24,19 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install production dependencies only
+# Only copy production dependencies and the compiled dist folder
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm install 
 
-# Move all necessary folders from the builder stage
 COPY --from=builder /app/dist ./dist
+
 COPY --from=builder /app/public ./public
 
-# Ensure directory permissions
+# Create the profile directory used in config.ts
 RUN mkdir -p /tmp/scraper-profile && chmod -R 777 /tmp/scraper-profile
 
 ENV NODE_ENV=production
 EXPOSE 3000
 
+# Run the compiled JavaScript file directly with Node
 CMD ["node", "dist/main.js"]
