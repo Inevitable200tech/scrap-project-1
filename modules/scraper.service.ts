@@ -48,7 +48,7 @@ export async function performScrape(url: string, streamId: string) {
     // Network Sniffer
     page.on('request', request => {
       const reqUrl = request.url();
-      const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)/i.test(reqUrl);
+      const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|dtscout|ad-delivery|popads|doubleclick|securepubads|\.ts($|\?)/i.test(reqUrl);
 
       if (!isBlacklisted && (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4'))) {
         if (reqUrl !== url && !interceptedVideos.some(v => v.url === reqUrl)) {
