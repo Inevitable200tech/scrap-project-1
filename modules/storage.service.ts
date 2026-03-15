@@ -7,7 +7,8 @@ import { PassThrough, Readable } from "stream";
 import { spawn } from "child_process";
 import { R2_CONFIG, MONGO_URI, MONGO_DB } from "./config.js";
 
-const s3Client = new S3Client({
+// Exported for use in main.ts (for generating Signed URLs)
+export const s3Client = new S3Client({
   region: "auto",
   endpoint: R2_CONFIG.endpoint,
   credentials: R2_CONFIG.credentials,
@@ -16,7 +17,8 @@ const s3Client = new S3Client({
 let db: Db;
 const mongoClient = new MongoClient(MONGO_URI);
 
-async function getDb() {
+// Exported for use in main.ts (for listing videos)
+export async function getDb() {
   if (!db) {
     await mongoClient.connect();
     db = mongoClient.db(MONGO_DB);
@@ -29,9 +31,15 @@ export interface ProcessingResult {
   hash?: string;
   r2Key?: string;
   error?: string;
+  isDuplicate?: boolean;
 }
 
+/**
+ * Downloads/Streams video to R2 and saves metadata to MongoDB
+ */
 export async function processAndStoreVideo(videoUrl: string, title: string): Promise<ProcessingResult> {
+  let ffmpegProcess: any = null;
+
   try {
     const isM3U8 = videoUrl.includes('.m3u8');
     const uploadStream = new PassThrough();
@@ -41,34 +49,35 @@ export async function processAndStoreVideo(videoUrl: string, title: string): Pro
     let videoSource: Readable;
 
     if (isM3U8) {
-      console.log(`[STORAGE] HLS Stream detected. Invoking FFmpeg...`);
-      // FFmpeg acts as the 'downloader' for m3u8 segments
-      const ffmpeg = spawn('ffmpeg', [
+      console.log(`[STORAGE] HLS detected. Starting FFmpeg: ${videoUrl}`);
+      ffmpegProcess = spawn('ffmpeg', [
         '-i', videoUrl,
-        '-c', 'copy',             // No re-encoding (keeps quality & saves CPU)
-        '-bsf:a', 'aac_adtstoasc', // Standard fix for MP4 audio streams
-        '-movflags', 'frag_keyframe+empty_moov', // Enables streaming to S3/R2
+        '-c', 'copy',
+        '-bsf:a', 'aac_adtstoasc',
+        '-movflags', 'frag_keyframe+empty_moov',
         '-f', 'mp4',
-        'pipe:1'                  // Sends the output to stdout
+        'pipe:1'
       ]);
       
-      videoSource = ffmpeg.stdout;
+      videoSource = ffmpegProcess.stdout;
 
-      ffmpeg.stderr.on('data', (data) => {
+      // Handle FFmpeg errors to prevent hanging
+      ffmpegProcess.on('error', (err: any) => console.error('[FFMPEG SPAWN ERROR]:', err));
+      ffmpegProcess.stderr.on('data', (data: any) => {
         if (data.toString().includes('Error')) console.error(`[FFMPEG]: ${data}`);
       });
     } else {
-      console.log(`[STORAGE] Direct MP4 detected. Using Axios stream...`);
+      console.log(`[STORAGE] Direct link detected: ${videoUrl}`);
       const response = await axios({
         method: 'get',
         url: videoUrl,
         responseType: 'stream',
-        timeout: 60000,
+        timeout: 90000, // Increased timeout for large files
       });
       videoSource = response.data;
     }
 
-    // Branch the data: one path for the SHA-256 hash, one for the R2 Upload
+    // Process data through Hash and Upload simultaneously
     videoSource.on('data', (chunk) => hash.update(chunk));
     videoSource.pipe(uploadStream);
 
@@ -82,13 +91,21 @@ export async function processAndStoreVideo(videoUrl: string, title: string): Pro
       },
       queueSize: 4,
       partSize: 1024 * 1024 * 5,
+      leavePartsOnError: false,
     });
 
     await upload.done();
     const finalHash = hash.digest('hex');
 
-    // Save metadata to MongoDB for later retrieval
     const database = await getDb();
+    
+    // Check for duplicates based on hash before inserting
+    const existing = await database.collection('videos').findOne({ hash: finalHash });
+    if (existing) {
+      console.log(`[STORAGE] Duplicate found. Skipping DB insert for ${r2Key}`);
+      return { success: true, hash: finalHash, r2Key: existing.r2Key, isDuplicate: true };
+    }
+
     await database.collection('videos').insertOne({
       title,
       hash: finalHash,
@@ -100,6 +117,8 @@ export async function processAndStoreVideo(videoUrl: string, title: string): Pro
 
     return { success: true, hash: finalHash, r2Key };
   } catch (error: any) {
+    // Cleanup FFmpeg if it crashes
+    if (ffmpegProcess) ffmpegProcess.kill('SIGKILL');
     console.error(`[STORAGE ERROR]: ${error.message}`);
     return { success: false, error: error.message };
   }

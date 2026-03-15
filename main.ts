@@ -1,13 +1,46 @@
 import express from 'express';
 import pLimit from 'p-limit';
 import { performScrape } from './modules/scraper.service.js';
-import { processAndStoreVideo } from './modules/storage.service.js'; // Import your storage service
-import { PORT, CONCURRENCY_LIMIT } from './modules/config.js';
+import { processAndStoreVideo, getDb, s3Client } from './modules/storage.service.js'; 
+import { GetObjectCommand } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { PORT, CONCURRENCY_LIMIT, R2_CONFIG } from './modules/config.js';
 
 const app = express();
 app.use(express.json());
 const limit = pLimit(CONCURRENCY_LIMIT);
 
+/**
+ * NEW: Endpoint to see all videos and get playable links
+ */
+app.get('/api/videos', async (req, res) => {
+  try {
+    const db = await getDb();
+    const videos = await db.collection('videos').find().sort({ processedAt: -1 }).toArray();
+
+    // Generate temporary playable links for each video
+    const playableVideos = await Promise.all(videos.map(async (video) => {
+      const command = new GetObjectCommand({
+        Bucket: R2_CONFIG.bucket,
+        Key: video.r2Key,
+      });
+
+      // URL expires in 1 hour
+      const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+
+      return {
+        ...video,
+        playUrl: signedUrl
+      };
+    }));
+
+    res.json(playableVideos);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Existing Scrape Endpoint
 app.post('/api/scrape', async (req, res) => {
   const { url, title } = req.body;
   const streamId = Math.random().toString(36).substring(7);
@@ -15,47 +48,30 @@ app.post('/api/scrape', async (req, res) => {
   if (!url) return res.status(400).json({ error: 'URL required' });
 
   try {
-    // 1. Perform Scraping (wrapped in pLimit)
     let scrapeResult = await limit(() => performScrape(url, streamId));
 
-    // Retry Logic if no videos found
     if (scrapeResult.videos.length === 0) {
-      console.log(`[RETRY] ID: ${streamId}`);
       await new Promise(r => setTimeout(r, 5000));
       scrapeResult = await limit(() => performScrape(url, streamId));
     }
 
-    // If still no videos found after retry, return 202
     if (scrapeResult.videos.length === 0) {
-      return res.status(202).json({ 
-        error: 'No videos found after retries', 
-        retryAfter: 300 
-      });
+      return res.status(202).json({ error: 'No videos found', retryAfter: 300 });
     }
 
-    // 2. Video found, now try to Download and Upload to R2
-    // We take the first video URL found by the scraper
     const targetVideoUrl = scrapeResult.videos[0].url;
     const storageResult = await processAndStoreVideo(targetVideoUrl, title || `Scraped_${streamId}`);
 
     if (storageResult.success) {
-      // Return 200 if both scrape and upload succeeded
-      return res.status(200).json({
+      res.status(200).json({
         message: 'Successfully scraped and uploaded',
         hash: storageResult.hash,
         r2Key: storageResult.r2Key,
         ...scrapeResult
       });
     } else {
-      // Return 304 if scraped but upload failed
-      // Note: 304 usually has no body, but Express allows sending JSON with it
-      return res.status(304).json({
-        error: 'Video scraped but failed to upload to storage',
-        details: storageResult.error,
-        scrapeResult
-      });
+      res.status(304).json({ error: 'Upload failed', details: storageResult.error });
     }
-
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
