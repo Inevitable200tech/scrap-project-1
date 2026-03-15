@@ -11,7 +11,7 @@ export const filterVideoUrls = (videos: any[], originalUrl: string) => {
     // --- BLACKLISTS ---
     const isOriginal = v.url === originalUrl;
     const isBlob = vUrl.startsWith('blob:');
-    const isAdDomain = /afcdn\.net|adsystem|clck\.ru|doubleclick|popads|exoclick/i.test(vUrl);
+    const isAdDomain = /afcdn\.net|adsystem|clck\.ru|doubleclick|popads|dtscdn|exoclick/i.test(vUrl);
     const isTracker = /yandex|mc\.ru|analytics|pixel|google|facebook|amazon|\.ts($|\?)/i.test(vUrl);
     
     // --- WHITELIST LOGIC ---

@@ -46,12 +46,30 @@ export async function performScrape(url: string, streamId: string) {
     });
 
     // Network Sniffer
+    // Updated Network Sniffer in scraper.service.ts
     page.on('request', request => {
       const reqUrl = request.url();
-      const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|dtscout|ad-delivery|popads|doubleclick|securepubads|\.ts($|\?)/i.test(reqUrl);
 
-      if (!isBlacklisted && (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4'))) {
-        if (reqUrl !== url && !interceptedVideos.some(v => v.url === reqUrl)) {
+      // 1. Target specific ad domains like t.dtscdn.com and tracking parameters
+      const isAdOrTracker = /yandex|mc\.ru|analytics|dtscdn|pixel|google|dtscout|ad-delivery|popads|doubleclick|securepubads/i.test(reqUrl);
+
+      // 2. Block .ts segments which are often mistaken for video files but are just stream parts
+      const isStreamSegment = /\.ts($|\?)/i.test(reqUrl);
+
+      if (isAdOrTracker || isStreamSegment) {
+        // Abort or ignore the request immediately to save CPU and avoid false positives
+        return;
+      }
+
+      // 3. Capture legitimate video signals
+      const isVideo = reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4');
+
+      if (isVideo && reqUrl !== url && !interceptedVideos.some(v => v.url === reqUrl)) {
+        // Priority check: Always prioritize the direct Streamtape 'get_video' link
+        if (reqUrl.includes('get_video')) {
+          console.log(`[CATCH-PRIORITY] [ID: ${streamId}] Found Direct Stream: ${reqUrl.substring(0, 60)}...`);
+          interceptedVideos.unshift({ site: 'Network-Sniffer-Direct', url: reqUrl });
+        } else {
           console.log(`[CATCH] [ID: ${streamId}] Found: ${reqUrl.substring(0, 60)}...`);
           interceptedVideos.push({ site: 'Network-Sniffer', url: reqUrl });
         }
@@ -100,18 +118,39 @@ export async function performScrape(url: string, streamId: string) {
       });
       if (vjsSource && !vjsSource.startsWith('blob:')) interceptedVideos.push({ site: 'VJS-Internal', url: vjsSource });
 
-    } else {
+    }
+    else {
       console.log(`[DEBUG] [ID: ${streamId}] Strategy: GENERAL/STREAMTAPE`);
-      try {
-        const playBtn = '.plyr__control--overlaid, .play-overlay, button[data-plyr="play"]';
-        await page.waitForSelector(playBtn, { timeout: 10000 });
-        await page.click(playBtn, { force: true });
-        await page.waitForTimeout(1500);
-        await page.evaluate((sel) => {
-          const btn = document.querySelector(sel) as HTMLElement;
-          if (btn) btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-        }, playBtn);
-      } catch (err) { }
+
+      // 1. Initial wait to see if 'get_video' pops up automatically on load
+      await page.waitForTimeout(3000);
+
+      // 2. Check if we already have a direct streamtape link in our intercepted list
+      const hasDirectLink = interceptedVideos.some(v => v.url.includes('get_video?id='));
+
+      if (hasDirectLink) {
+        console.log(`[DEBUG] [ID: ${streamId}] Direct link already captured. Skipping clicks.`);
+      } else {
+        // 3. Fallback: Perform the manual click if no link was found yet
+        try {
+          // Remove overlays that might block the button
+          await page.evaluate(() => {
+            const ads = document.querySelectorAll('div[style*="z-index: 2147483647"]');
+            ads.forEach(el => el.remove());
+          });
+
+          const playBtn = '.plyr__control--overlaid, .play-overlay, button[data-plyr="play"], #videooverlay';
+          await page.waitForSelector(playBtn, { timeout: 5000 }).catch(() => { });
+
+          // Force a click on the play button
+          await page.click(playBtn, { force: true }).catch(() => { });
+
+          // Wait extra time for Streamtape's dynamic link to generate
+          await page.waitForTimeout(3000);
+        } catch (err) {
+          console.warn(`[DEBUG] [ID: ${streamId}] Click strategy failed or timed out.`);
+        }
+      }
     }
 
     // Fallback: DOM Extraction
