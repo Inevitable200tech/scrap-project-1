@@ -1,52 +1,45 @@
 import playwrightExtra from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
 import { filterVideoUrls } from './utils.js';
 
 playwrightExtra.chromium.use(StealthPlugin());
 
-// Define the interface so other files know what this returns
 export interface ScrapeResult {
   title: string;
   videos: { site: string; url: string }[];
 }
 
-
-// Exporting with explicit return type to fix 'void' errors in main.ts
 export async function performScrape(url: string, streamId: string): Promise<ScrapeResult> {
-
   const isVidara = /vidara\./i.test(url);
   const isVidsonic = /vidsonic\./i.test(url);
   const isVidnest = /vidnest\./i.test(url);
 
-  // Logical fix: We must actually call and return the inner function
   const scrapeAttempt = async (): Promise<ScrapeResult> => {
-    let browser;
+    // Define both browser and context variables for proper cleanup
+    let browser: any = null;
+    let context: any = null;
+
     try {
       console.log(`[START] [ID: ${streamId}] Scrape Target: ${url}`);
-      const userDataDir = path.join(os.tmpdir(), 'dropmms-api-profile');
 
-      if (fs.existsSync(path.join(userDataDir, 'SingletonLock'))) {
-        try { fs.unlinkSync(path.join(userDataDir, 'SingletonLock')); } catch { }
-      }
-
-      browser = await playwrightExtra.chromium.launchPersistentContext(userDataDir, {
+      // FIX 1: Use standard launch() instead of persistent context to prevent lock conflicts
+      browser = await playwrightExtra.chromium.launch({
         headless: true,
         args: [
           '--no-sandbox', '--disable-dev-shm-usage', '--no-zygote',
           '--disable-setuid-sandbox', '--disable-infobars', '--window-size=1280,900',
           '--disable-blink-features=AutomationControlled',
         ],
+      });
+
+      // FIX 2: Create a clean, isolated context
+      context = await browser.newContext({
         viewport: { width: 1280, height: 900 },
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/131.0.0.0 Safari/537.36',
       });
 
-      const page = await browser.newPage();
-      const interceptedVideos: any[] = [];
-
-      browser.on('page', async popup => {
+      // FIX 3: Attach the popup listener to the context rather than the browser
+      context.on('page', async (popup: any) => {
         try {
           await new Promise(resolve => setTimeout(resolve, 8000));
           if (!popup.isClosed()) {
@@ -55,7 +48,11 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         } catch (e) { }
       });
 
-      page.on('request', request => {
+      // Open the primary page
+      const page = await context.newPage();
+      const interceptedVideos: any[] = [];
+
+      page.on('request', (request: { url: () => any; }) => {
         const reqUrl = request.url();
         const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)/i.test(reqUrl);
 
@@ -108,7 +105,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           await page.waitForSelector(playBtn, { timeout: 10000 });
           await page.click(playBtn, { force: true });
           await page.waitForTimeout(1500);
-          await page.evaluate((sel) => {
+          await page.evaluate((sel: any) => {
             const btn = document.querySelector(sel) as HTMLElement;
             if (btn) btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
           }, playBtn);
@@ -127,17 +124,21 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       }
 
       const title = await page.title().catch(() => "Unknown Title");
+      
+      // FIX 4: Properly close both context and browser to free memory
+      if (context) await context.close().catch(() => { });
       if (browser) await browser.close().catch(() => { });
 
       const filteredVideos = filterVideoUrls(interceptedVideos, url);
       return { title, videos: filteredVideos };
 
     } catch (error: any) {
-      if (browser) await browser.close();
+      // FIX 5: Ensure cleanup runs even if an error is thrown
+      if (context) await context.close().catch(() => { });
+      if (browser) await browser.close().catch(() => { });
       throw error;
     }
   };
 
-  // Fix: Execute the attempt and return the Promise
   return scrapeAttempt();
 }
