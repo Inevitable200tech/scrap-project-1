@@ -24,12 +24,13 @@ function isPageAlive(p: any): boolean {
 }
 
 export async function performScrape(url: string, streamId: string): Promise<ScrapeResult> {
-  const isVidara   = /vidara\./i.test(url);
-  const isVidsonic = /vidsonic\./i.test(url);
-  const isVidnest  = /vidnest\./i.test(url);
+  const isVidara     = /vidara\./i.test(url);
+  const isVidsonic   = /vidsonic\./i.test(url);
+  const isVidnest    = /vidnest\./i.test(url);
+  const isStreamtape = /streamtape\./i.test(url);
 
   log(streamId, `Starting scrape for URL: ${url}`);
-  log(streamId, `Site detection → Vidara: ${isVidara}, Vidsonic: ${isVidsonic}, Vidnest: ${isVidnest}`);
+  log(streamId, `Site detection → Vidara: ${isVidara}, Vidsonic: ${isVidsonic}, Vidnest: ${isVidnest}, Streamtape: ${isStreamtape}`);
 
   const scrapeAttempt = async (): Promise<ScrapeResult> => {
     let browser: any = null;
@@ -37,7 +38,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
     let page: any = null;
 
     try {
-      // ── Browser launch ───────────────────────────────────────────────────────
+      // ── Browser launch ─────────────────────────────────────────────────────
       log(streamId, 'Launching browser...');
       browser = await playwrightExtra.chromium.launch({
         headless: true,
@@ -53,7 +54,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
       log(streamId, 'Browser launched successfully');
 
-      // ── Browser context ──────────────────────────────────────────────────────
+      // ── Browser context ────────────────────────────────────────────────────
       log(streamId, 'Creating new browser context...');
       context = await browser.newContext({
         viewport: { width: 1280, height: 900 },
@@ -62,10 +63,9 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
       log(streamId, 'Browser context created');
 
-      // ── Primary page ─────────────────────────────────────────────────────────
-      // IMPORTANT: open the primary page BEFORE registering context.on('page').
-      // The 'page' event fires for every new page including this one. If the
-      // handler were registered first it would immediately close our own tab.
+      // ── Primary page ───────────────────────────────────────────────────────
+      // Open BEFORE registering context.on('page') so the handler never sees
+      // our own tab and accidentally closes it.
       log(streamId, 'Opening primary page...');
       page = await context.newPage();
       log(streamId, 'Primary page opened');
@@ -77,10 +77,9 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       });
 
-      // ── Popup handler ────────────────────────────────────────────────────────
-      // Registered AFTER the primary page so it never matches our own tab.
+      // ── Popup handler ──────────────────────────────────────────────────────
+      // Registered AFTER primary page so it never matches our own tab.
       context.on('page', async (popup: any) => {
-        // Extra guard: skip if this somehow is our primary page reference
         if (popup === page) return;
 
         const popupUrl = popup.url?.() || '(unknown)';
@@ -102,13 +101,15 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       });
 
-      // ── Network interception ─────────────────────────────────────────────────
+      // ── Network interception ───────────────────────────────────────────────
       const interceptedVideos: { site: string; url: string }[] = [];
 
       log(streamId, 'Attaching network request interceptor...');
       page.on('request', (request: { url: () => string }) => {
         const reqUrl = request.url();
-        const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)/i.test(reqUrl);
+
+        // Extended blacklist — ad trackers, analytics, CDN ad networks
+        const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)|dtscout|dtscdn|doubleclick|adnxs|adsystem|googlesyndication|amazon-adsystem|outbrain|taboola|adsbygoogle/i.test(reqUrl);
 
         if (
           !isBlacklisted &&
@@ -121,7 +122,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       });
 
-      // ── Navigation ───────────────────────────────────────────────────────────
+      // ── Navigation ─────────────────────────────────────────────────────────
       log(streamId, `Navigating to: ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e: any) => {
         log(streamId, `Navigation error (non-fatal): ${e.message}`, 'WARN');
@@ -131,11 +132,14 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         throw new Error('Primary page was closed unexpectedly after navigation');
       }
 
-      // Give background requests (ads, video fetch) a moment to start
-      await page.waitForTimeout(3500).catch(() => {});
+      // Skip the wait for Streamtape — its URL is in the initial HTML, no JS
+      // execution needed. For all other sites keep the 3.5s background warm-up.
+      if (!isStreamtape) {
+        await page.waitForTimeout(3500).catch(() => {});
+      }
       log(streamId, 'Navigation phase completed');
 
-      // ── Player-specific extraction ───────────────────────────────────────────
+      // ── Player-specific extraction ─────────────────────────────────────────
       if (isVidara || isVidnest) {
         log(streamId, 'Vidara / Vidnest detected → JW Player path');
         const playSelector = '.jw-video, .jw-display-icon-container, video';
@@ -198,6 +202,43 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           log(streamId, 'No valid Video.js source found');
         }
 
+      } else if (isStreamtape) {
+        log(streamId, 'Streamtape detected → norobotlink / video src extraction');
+
+        // The URL is embedded in the initial HTML — no click or extra wait needed.
+        // #norobotlink is a <div> whose textContent is set by an inline <script>
+        // immediately on page load. The <video> src attribute is also in the HTML.
+        const streamtapeUrl = await page.evaluate(() => {
+          try {
+            // Method 1: #norobotlink — most reliable, always present after load
+            const norobotEl = document.getElementById('norobotlink');
+            if (norobotEl) {
+              let href = norobotEl.textContent?.trim() || '';
+              if (href.startsWith('//')) return 'https:' + href;
+              if (href.startsWith('https://')) return href;
+            }
+
+            // Method 2: raw src attribute on <video> (already in HTML, no play needed)
+            const video = document.querySelector('video');
+            if (video) {
+              let src = video.getAttribute('src') || '';
+              if (src.startsWith('//')) return 'https:' + src;
+              if (src.startsWith('https://')) return src;
+            }
+
+            return null;
+          } catch {
+            return null;
+          }
+        }).catch(() => null);
+
+        if (streamtapeUrl) {
+          log(streamId, `Streamtape URL extracted: ${String(streamtapeUrl).substring(0, 90)}...`);
+          interceptedVideos.push({ site: 'Streamtape-DOM', url: streamtapeUrl });
+        } else {
+          log(streamId, 'Streamtape extraction failed — will rely on network sniffer', 'WARN');
+        }
+
       } else {
         log(streamId, 'Generic player path (Plyr / overlay attempt)');
         try {
@@ -217,24 +258,27 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       }
 
-      // ── DOM <video> fallback ─────────────────────────────────────────────────
-      log(streamId, 'Checking <video> element source...');
-      const domMedia = isPageAlive(page)
-        ? await page.evaluate(() => {
-            const video = document.querySelector('video') as HTMLVideoElement | null;
-            if (!video) return null;
-            const src = video.currentSrc || video.src || '';
-            return src && !src.startsWith('blob:') ? src : null;
-          }).catch(() => null)
-        : null;
+      // ── DOM <video> fallback ───────────────────────────────────────────────
+      // Skip for Streamtape — already extracted above, no need to re-check
+      if (!isStreamtape) {
+        log(streamId, 'Checking <video> element source...');
+        const domMedia = isPageAlive(page)
+          ? await page.evaluate(() => {
+              const video = document.querySelector('video') as HTMLVideoElement | null;
+              if (!video) return null;
+              const src = video.currentSrc || video.src || '';
+              return src && !src.startsWith('blob:') ? src : null;
+            }).catch(() => null)
+          : null;
 
-      if (domMedia) {
-        log(streamId, `DOM video src: ${String(domMedia).substring(0, 90)}...`);
-        if (!interceptedVideos.some(v => v.url === domMedia)) {
-          interceptedVideos.push({ site: 'DOM-Extraction', url: domMedia });
+        if (domMedia) {
+          log(streamId, `DOM video src: ${String(domMedia).substring(0, 90)}...`);
+          if (!interceptedVideos.some(v => v.url === domMedia)) {
+            interceptedVideos.push({ site: 'DOM-Extraction', url: domMedia });
+          }
+        } else {
+          log(streamId, 'No usable <video> source found in DOM');
         }
-      } else {
-        log(streamId, 'No usable <video> source found in DOM');
       }
 
       const title = isPageAlive(page)
@@ -244,7 +288,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       log(streamId, `Page title: ${title}`);
       log(streamId, `Collected ${interceptedVideos.length} candidate video URLs`);
 
-      // ── Cleanup ──────────────────────────────────────────────────────────────
+      // ── Cleanup ────────────────────────────────────────────────────────────
       log(streamId, 'Initiating cleanup...');
       await context?.close().catch((e: any) =>
         log(streamId, `Context close failed: ${e.message}`, 'WARN')
@@ -263,7 +307,6 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       log(streamId, `SCRAPE FAILED: ${error.message || 'Unknown error'}`, 'ERROR');
       if (error?.stack) log(streamId, `Stack:\n${error.stack}`, 'ERROR');
 
-      // Emergency cleanup
       await context?.close().catch(() => {});
       await browser?.close().catch(() => {});
 
