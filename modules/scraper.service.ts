@@ -58,7 +58,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         log(streamId, `New page/popup detected → ${popupUrl}`);
         try {
           log(streamId, 'Waiting 8 seconds before auto-closing popup...');
-          await new Promise(resolve => setTimeout(resolve, 8000));
+          await new Promise(resolve => setTimeout(resolve, 2000));
 
           if (!popup.isClosed()) {
             log(streamId, 'Closing detected popup');
@@ -93,7 +93,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
 
       log(streamId, `Navigating to: ${url}`);
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e: any) => {
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 }).catch((e: any) => {
         log(streamId, `Navigation error (non-fatal): ${e.message}`, 'WARN');
       });
       log(streamId, 'Navigation phase completed');
