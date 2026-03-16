@@ -15,8 +15,16 @@ function log(streamId: string, message: string, level: 'INFO' | 'WARN' | 'ERROR'
   console[level.toLowerCase() as 'log' | 'warn' | 'error'](`${prefix} ${message}`);
 }
 
+function isPageAlive(p: any): boolean {
+  try {
+    return p && !p.isClosed();
+  } catch {
+    return false;
+  }
+}
+
 export async function performScrape(url: string, streamId: string): Promise<ScrapeResult> {
-  const isVidara  = /vidara\./i.test(url);
+  const isVidara   = /vidara\./i.test(url);
   const isVidsonic = /vidsonic\./i.test(url);
   const isVidnest  = /vidnest\./i.test(url);
 
@@ -29,6 +37,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
     let page: any = null;
 
     try {
+      // ── Browser launch ───────────────────────────────────────────────────────
       log(streamId, 'Launching browser...');
       browser = await playwrightExtra.chromium.launch({
         headless: true,
@@ -44,30 +53,47 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
       log(streamId, 'Browser launched successfully');
 
+      // ── Browser context ──────────────────────────────────────────────────────
       log(streamId, 'Creating new browser context...');
       context = await browser.newContext({
         viewport: { width: 1280, height: 900 },
         userAgent:
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       });
       log(streamId, 'Browser context created');
 
-      // ────────────────────────────────────────────────
-      // Updated popup handler – close much faster
-      // ────────────────────────────────────────────────
+      // ── Primary page ─────────────────────────────────────────────────────────
+      // IMPORTANT: open the primary page BEFORE registering context.on('page').
+      // The 'page' event fires for every new page including this one. If the
+      // handler were registered first it would immediately close our own tab.
+      log(streamId, 'Opening primary page...');
+      page = await context.newPage();
+      log(streamId, 'Primary page opened');
+
+      page.on('close', () => log(streamId, 'PAGE CLOSED EVENT FIRED', 'ERROR'));
+      page.on('console', (msg: any) => {
+        if (msg.type() === 'error') {
+          log(streamId, `PAGE CONSOLE ERROR: ${msg.text()}`, 'ERROR');
+        }
+      });
+
+      // ── Popup handler ────────────────────────────────────────────────────────
+      // Registered AFTER the primary page so it never matches our own tab.
       context.on('page', async (popup: any) => {
+        // Extra guard: skip if this somehow is our primary page reference
+        if (popup === page) return;
+
         const popupUrl = popup.url?.() || '(unknown)';
         log(streamId, `New page/popup detected → ${popupUrl}`);
 
         try {
-          // Very short delay – most ad popups need <1s to be detectable
           await new Promise(resolve => setTimeout(resolve, 800));
 
           if (!popup.isClosed()) {
-            log(streamId, 'Closing popup quickly');
-            await popup.close({ runBeforeUnload: false }).catch((e: any) => {
-              log(streamId, `Popup close failed: ${e.message}`, 'WARN');
-            });
+            log(streamId, 'Closing popup');
+            await popup.close({ runBeforeUnload: false }).catch((e: any) =>
+              log(streamId, `Popup close failed: ${e.message}`, 'WARN')
+            );
           } else {
             log(streamId, 'Popup already closed');
           }
@@ -76,18 +102,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       });
 
-      log(streamId, 'Opening primary page...');
-      page = await context.newPage();
-      log(streamId, 'Primary page opened');
-
-      // Lightweight diagnostics – helps understand why page dies
-      page.on('close', () => log(streamId, 'PAGE CLOSED EVENT FIRED', 'ERROR'));
-      page.on('console', (msg: any) => {
-        if (msg.type() === 'error') {
-          log(streamId, `PAGE CONSOLE ERROR: ${msg.text()}`, 'ERROR');
-        }
-      });
-
+      // ── Network interception ─────────────────────────────────────────────────
       const interceptedVideos: { site: string; url: string }[] = [];
 
       log(streamId, 'Attaching network request interceptor...');
@@ -95,7 +110,10 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         const reqUrl = request.url();
         const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)/i.test(reqUrl);
 
-        if (!isBlacklisted && (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4'))) {
+        if (
+          !isBlacklisted &&
+          (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4'))
+        ) {
           if (reqUrl !== url && !interceptedVideos.some(v => v.url === reqUrl)) {
             log(streamId, `VIDEO URL INTERCEPTED → ${reqUrl.substring(0, 100)}...`);
             interceptedVideos.push({ site: 'Network-Sniffer', url: reqUrl });
@@ -103,27 +121,29 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       });
 
+      // ── Navigation ───────────────────────────────────────────────────────────
       log(streamId, `Navigating to: ${url}`);
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e: any) => {
         log(streamId, `Navigation error (non-fatal): ${e.message}`, 'WARN');
       });
 
-      // Give a moment for background requests (ads, video fetch) to start
-      await page.waitForTimeout(3500).catch(() => {});
+      if (!isPageAlive(page)) {
+        throw new Error('Primary page was closed unexpectedly after navigation');
+      }
 
+      // Give background requests (ads, video fetch) a moment to start
+      await page.waitForTimeout(3500).catch(() => {});
       log(streamId, 'Navigation phase completed');
 
-      // ────────────────────────────────────────────────
-      // Site/player-specific extraction logic
-      // ────────────────────────────────────────────────
+      // ── Player-specific extraction ───────────────────────────────────────────
       if (isVidara || isVidnest) {
         log(streamId, 'Vidara / Vidnest detected → JW Player path');
         const playSelector = '.jw-video, .jw-display-icon-container, video';
         log(streamId, `Attempting click: ${playSelector}`);
-        await page.click(playSelector, { force: true, timeout: 10000 }).catch((e: { message: any; }) =>
+        await page.click(playSelector, { force: true, timeout: 10000 }).catch((e: any) =>
           log(streamId, `Play click failed: ${e.message}`, 'WARN')
         );
-        await page.waitForTimeout(2200);
+        await page.waitForTimeout(2200).catch(() => {});
 
         log(streamId, 'Extracting JW Player source...');
         const jwSource = await page.evaluate(() => {
@@ -133,10 +153,10 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           } catch {
             return null;
           }
-        });
+        }).catch(() => null);
 
         if (jwSource) {
-          log(streamId, `JW source extracted: ${jwSource.substring(0, 90)}...`);
+          log(streamId, `JW source extracted: ${String(jwSource).substring(0, 90)}...`);
           interceptedVideos.push({ site: 'JW-Internal', url: jwSource });
         } else {
           log(streamId, 'No JW Player source found');
@@ -150,10 +170,10 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
 
         const playSelector = '.vjs-big-play-button, .vjs-play-control';
         log(streamId, `Attempting click: ${playSelector}`);
-        await page.click(playSelector, { force: true, timeout: 10000 }).catch((e: { message: any; }) =>
+        await page.click(playSelector, { force: true, timeout: 10000 }).catch((e: any) =>
           log(streamId, `Video.js click failed: ${e.message}`, 'WARN')
         );
-        await page.waitForTimeout(2200);
+        await page.waitForTimeout(2200).catch(() => {});
 
         log(streamId, 'Extracting Video.js source...');
         const vjsSource = await page.evaluate(() => {
@@ -169,10 +189,10 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           } catch {
             return null;
           }
-        });
+        }).catch(() => null);
 
-        if (vjsSource && !vjsSource.startsWith('blob:')) {
-          log(streamId, `Video.js source: ${vjsSource.substring(0, 90)}...`);
+        if (vjsSource && !String(vjsSource).startsWith('blob:')) {
+          log(streamId, `Video.js source: ${String(vjsSource).substring(0, 90)}...`);
           interceptedVideos.push({ site: 'VJS-Internal', url: vjsSource });
         } else {
           log(streamId, 'No valid Video.js source found');
@@ -186,31 +206,30 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           await page.waitForSelector(playSelector, { timeout: 12000 });
           log(streamId, 'Play element found → clicking');
           await page.click(playSelector, { force: true });
-
-          await page.waitForTimeout(1800);
+          await page.waitForTimeout(1800).catch(() => {});
 
           await page.evaluate((sel: string) => {
             const btn = document.querySelector(sel) as HTMLElement | null;
             btn?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-          }, playSelector);
+          }, playSelector).catch(() => {});
         } catch (err: any) {
           log(streamId, `Generic play attempt failed: ${err.message}`, 'WARN');
         }
       }
 
-      // ────────────────────────────────────────────────
-      // Final DOM <video> fallback
-      // ────────────────────────────────────────────────
+      // ── DOM <video> fallback ─────────────────────────────────────────────────
       log(streamId, 'Checking <video> element source...');
-      const domMedia = await page.evaluate(() => {
-        const video = document.querySelector('video') as HTMLVideoElement | null;
-        if (!video) return null;
-        const src = video.currentSrc || video.src || '';
-        return src && !src.startsWith('blob:') ? src : null;
-      });
+      const domMedia = isPageAlive(page)
+        ? await page.evaluate(() => {
+            const video = document.querySelector('video') as HTMLVideoElement | null;
+            if (!video) return null;
+            const src = video.currentSrc || video.src || '';
+            return src && !src.startsWith('blob:') ? src : null;
+          }).catch(() => null)
+        : null;
 
       if (domMedia) {
-        log(streamId, `DOM video src: ${domMedia.substring(0, 90)}...`);
+        log(streamId, `DOM video src: ${String(domMedia).substring(0, 90)}...`);
         if (!interceptedVideos.some(v => v.url === domMedia)) {
           interceptedVideos.push({ site: 'DOM-Extraction', url: domMedia });
         }
@@ -218,43 +237,35 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         log(streamId, 'No usable <video> source found in DOM');
       }
 
-      const title = await page.title().catch(() => 'Unknown Title');
-      log(streamId, `Page title: ${title}`);
+      const title = isPageAlive(page)
+        ? await page.title().catch(() => 'Unknown Title')
+        : 'Unknown Title';
 
+      log(streamId, `Page title: ${title}`);
       log(streamId, `Collected ${interceptedVideos.length} candidate video URLs`);
 
-      // ────────────────────────────────────────────────
-      // Cleanup
-      // ────────────────────────────────────────────────
+      // ── Cleanup ──────────────────────────────────────────────────────────────
       log(streamId, 'Initiating cleanup...');
-      if (context) {
-        log(streamId, 'Closing context...');
-        await context.close().catch((e: { message: any; }) => log(streamId, `Context close failed: ${e.message}`, 'WARN'));
-      }
-      if (browser) {
-        log(streamId, 'Closing browser...');
-        await browser.close().catch((e: { message: any; }) => log(streamId, `Browser close failed: ${e.message}`, 'WARN'));
-      }
+      await context?.close().catch((e: any) =>
+        log(streamId, `Context close failed: ${e.message}`, 'WARN')
+      );
+      await browser?.close().catch((e: any) =>
+        log(streamId, `Browser close failed: ${e.message}`, 'WARN')
+      );
 
       const filteredVideos = filterVideoUrls(interceptedVideos, url);
       log(streamId, `Final result: ${filteredVideos.length} valid video URLs after filtering`);
-
       log(streamId, 'Scrape completed successfully');
+
       return { title, videos: filteredVideos };
 
     } catch (error: any) {
       log(streamId, `SCRAPE FAILED: ${error.message || 'Unknown error'}`, 'ERROR');
-      if (error?.stack) {
-        log(streamId, `Stack:\n${error.stack}`, 'ERROR');
-      }
+      if (error?.stack) log(streamId, `Stack:\n${error.stack}`, 'ERROR');
 
       // Emergency cleanup
-      try {
-        if (context) await context.close().catch(() => {});
-        if (browser) await browser.close().catch(() => {});
-      } catch (cleanupErr: any) {
-        log(streamId, `Cleanup during error handling failed: ${cleanupErr.message}`, 'ERROR');
-      }
+      await context?.close().catch(() => {});
+      await browser?.close().catch(() => {});
 
       throw error;
     }
