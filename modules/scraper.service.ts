@@ -23,13 +23,45 @@ function isPageAlive(p: any): boolean {
   }
 }
 
+/**
+ * Vidara loads its player inside a cross-origin iframe at vidara.so/e/<filecode>.
+ * We can't read that iframe from the parent page, so we rewrite the URL to
+ * navigate directly to the embed page where JW Player is accessible.
+ *
+ * Input:  https://vidara.to/v/BYs7T9uu9UdFP/some-title
+ * Output: https://vidara.so/e/BYs7T9uu9UdFP
+ */
+function resolveVidaraEmbedUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+
+    // Already an embed URL — use as-is
+    if (parsed.hostname.includes('vidara.so') && parsed.pathname.startsWith('/e/')) {
+      return url;
+    }
+
+    // Extract filecode from path — first non-empty segment after skipping 'v'
+    // e.g. /v/BYs7T9uu9UdFP/some-title → BYs7T9uu9UdFP
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    const filecode = segments[0] === 'v' ? segments[1] : segments[0];
+
+    return `https://vidara.so/e/${filecode}`;
+  } catch {
+    return url;
+  }
+}
+
 export async function performScrape(url: string, streamId: string): Promise<ScrapeResult> {
   const isVidara     = /vidara\./i.test(url);
   const isVidsonic   = /vidsonic\./i.test(url);
   const isVidnest    = /vidnest\./i.test(url);
   const isStreamtape = /streamtape\./i.test(url);
 
+  // Vidara: navigate directly to the embed page instead of the main page
+  const targetUrl = isVidara ? resolveVidaraEmbedUrl(url) : url;
+
   log(streamId, `Starting scrape for URL: ${url}`);
+  if (isVidara) log(streamId, `Vidara embed URL resolved → ${targetUrl}`);
   log(streamId, `Site detection → Vidara: ${isVidara}, Vidsonic: ${isVidsonic}, Vidnest: ${isVidnest}, Streamtape: ${isStreamtape}`);
 
   const scrapeAttempt = async (): Promise<ScrapeResult> => {
@@ -123,8 +155,9 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
 
       // ── Navigation ─────────────────────────────────────────────────────────
-      log(streamId, `Navigating to: ${url}`);
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e: any) => {
+      // Use targetUrl — embed URL for Vidara, original URL for everything else
+      log(streamId, `Navigating to: ${targetUrl}`);
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e: any) => {
         log(streamId, `Navigation error (non-fatal): ${e.message}`, 'WARN');
       });
 
@@ -132,16 +165,49 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         throw new Error('Primary page was closed unexpectedly after navigation');
       }
 
-      // Skip the wait for Streamtape — its URL is in the initial HTML, no JS
-      // execution needed. For all other sites keep the 3.5s background warm-up.
-      if (!isStreamtape) {
+      // Streamtape and Vidara have their data available immediately after load —
+      // skip the 3.5s warm-up wait for both.
+      if (!isStreamtape && !isVidara) {
         await page.waitForTimeout(3500).catch(() => {});
       }
       log(streamId, 'Navigation phase completed');
 
       // ── Player-specific extraction ─────────────────────────────────────────
-      if (isVidara || isVidnest) {
-        log(streamId, 'Vidara / Vidnest detected → JW Player path');
+      if (isVidara) {
+        log(streamId, 'Vidara detected → JW Player extraction from embed page');
+
+        // The embed page fetches /api/stream?filecode=... immediately on load and
+        // passes the result to JW Player. A short wait is enough for that fetch
+        // to complete and the playlist to be populated.
+        await page.waitForTimeout(3000).catch(() => {});
+
+        const vidaraUrl = await page.evaluate(() => {
+          try {
+            const p = (window as any).jwplayer?.();
+            if (!p) return null;
+
+            // Primary: playlist file (HLS m3u8 or direct mp4)
+            const file = p.getPlaylist?.()?.[0]?.file;
+            if (file && !file.startsWith('blob:')) return file;
+
+            // Fallback: first non-blob source in sources array
+            const sources: any[] = p.getPlaylist?.()?.[0]?.sources ?? [];
+            const valid = sources.find((s: any) => s.file && !s.file.startsWith('blob:'));
+            return valid?.file ?? null;
+          } catch {
+            return null;
+          }
+        }).catch(() => null);
+
+        if (vidaraUrl) {
+          log(streamId, `Vidara JW source extracted: ${String(vidaraUrl).substring(0, 90)}...`);
+          interceptedVideos.push({ site: 'Vidara-JW', url: vidaraUrl });
+        } else {
+          log(streamId, 'Vidara JW extraction failed — will rely on network sniffer', 'WARN');
+        }
+
+      } else if (isVidnest) {
+        log(streamId, 'Vidnest detected → JW Player path');
         const playSelector = '.jw-video, .jw-display-icon-container, video';
         log(streamId, `Attempting click: ${playSelector}`);
         await page.click(playSelector, { force: true, timeout: 10000 }).catch((e: any) =>
@@ -160,7 +226,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }).catch(() => null);
 
         if (jwSource) {
-          log(streamId, `JW source extracted: ${String(jwSource).substring(0, 90)}...`);
+          log(streamId, `Vidnest JW source extracted: ${String(jwSource).substring(0, 90)}...`);
           interceptedVideos.push({ site: 'JW-Internal', url: jwSource });
         } else {
           log(streamId, 'No JW Player source found');
@@ -259,8 +325,9 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       }
 
       // ── DOM <video> fallback ───────────────────────────────────────────────
-      // Skip for Streamtape — already extracted above, no need to re-check
-      if (!isStreamtape) {
+      // Skip for Streamtape and Vidara — both already handled above.
+      // Vidara's <video> only ever has a blob: src which is useless.
+      if (!isStreamtape && !isVidara) {
         log(streamId, 'Checking <video> element source...');
         const domMedia = isPageAlive(page)
           ? await page.evaluate(() => {
