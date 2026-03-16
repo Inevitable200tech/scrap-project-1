@@ -52,18 +52,21 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
       log(streamId, 'Browser context created');
 
-      // Popup / new page handler
+      // ────────────────────────────────────────────────
+      // Updated popup handler – close much faster
+      // ────────────────────────────────────────────────
       context.on('page', async (popup: any) => {
         const popupUrl = popup.url?.() || '(unknown)';
         log(streamId, `New page/popup detected → ${popupUrl}`);
+
         try {
-          log(streamId, 'Waiting 8 seconds before auto-closing popup...');
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          // Very short delay – most ad popups need <1s to be detectable
+          await new Promise(resolve => setTimeout(resolve, 800));
 
           if (!popup.isClosed()) {
-            log(streamId, 'Closing detected popup');
-            await popup.close().catch((e: any) => {
-              log(streamId, `Failed to close popup: ${e.message}`, 'WARN');
+            log(streamId, 'Closing popup quickly');
+            await popup.close({ runBeforeUnload: false }).catch((e: any) => {
+              log(streamId, `Popup close failed: ${e.message}`, 'WARN');
             });
           } else {
             log(streamId, 'Popup already closed');
@@ -76,6 +79,14 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       log(streamId, 'Opening primary page...');
       page = await context.newPage();
       log(streamId, 'Primary page opened');
+
+      // Lightweight diagnostics – helps understand why page dies
+      page.on('close', () => log(streamId, 'PAGE CLOSED EVENT FIRED', 'ERROR'));
+      page.on('console', (msg: any) => {
+        if (msg.type() === 'error') {
+          log(streamId, `PAGE CONSOLE ERROR: ${msg.text()}`, 'ERROR');
+        }
+      });
 
       const interceptedVideos: { site: string; url: string }[] = [];
 
@@ -93,9 +104,13 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
 
       log(streamId, `Navigating to: ${url}`);
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 }).catch((e: any) => {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e: any) => {
         log(streamId, `Navigation error (non-fatal): ${e.message}`, 'WARN');
       });
+
+      // Give a moment for background requests (ads, video fetch) to start
+      await page.waitForTimeout(3500).catch(() => {});
+
       log(streamId, 'Navigation phase completed');
 
       // ────────────────────────────────────────────────
