@@ -1,6 +1,5 @@
 // main.ts
 import express from 'express';
-import pLimit from 'p-limit';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { performScrape, ScrapeResult } from './modules/scraper.service.js';
@@ -12,10 +11,11 @@ import {
   getJob,
   updateJob,
   listJobs,
+  cleanupIncompleteMultipartUploads,
 } from './modules/storage.service.js';
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { PORT, CONCURRENCY_LIMIT, R2_CONFIG } from './modules/config.js';
+import { PORT, R2_CONFIG } from './modules/config.js';
 
 const app = express();
 app.use(express.json());
@@ -24,9 +24,64 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, '../public')));
 
-const limit = pLimit(CONCURRENCY_LIMIT);
+// ── Serial job queue ───────────────────────────────────────────────────────
+// Jobs are processed one at a time in the order they are submitted.
+// This eliminates CPU/bandwidth contention from parallel FFmpeg processes
+// and prevents Streamtape rate limiting from concurrent browser instances.
+const jobQueue: string[] = [];
+let isProcessing = false;
 
-// ── Background processor ───────────────────────────────────────────────────
+async function enqueueJob(jobId: string): Promise<void> {
+  jobQueue.push(jobId);
+  console.log(`[QUEUE] Job ${jobId} enqueued — position ${jobQueue.length}`);
+  // Kick off the processor if it's idle
+  if (!isProcessing) {
+    processNextJob();
+  }
+}
+
+async function processNextJob(): Promise<void> {
+  if (jobQueue.length === 0) {
+    isProcessing = false;
+    console.log('[QUEUE] Empty — processor idle');
+    return;
+  }
+
+  isProcessing = true;
+  const jobId = jobQueue.shift()!;
+  console.log(`[QUEUE] Starting job ${jobId} — ${jobQueue.length} remaining`);
+
+  try {
+    await processJob(jobId);
+  } catch (err: any) {
+    console.error(`[QUEUE] Job ${jobId} threw unhandled error: ${err.message}`);
+  }
+
+  // Process next job immediately after current one finishes
+  processNextJob();
+}
+
+// ── Per-host cooldown ──────────────────────────────────────────────────────
+// Extra protection against rate limiting even in serial mode —
+// if the same host appears back to back, enforce a minimum gap.
+const hostLastScraped = new Map<string, number>();
+const HOST_COOLDOWN_MS = 10_000; // 10s between scrapes of the same host
+
+async function enforceHostCooldown(url: string): Promise<void> {
+  try {
+    const hostname = new URL(url).hostname;
+    const last = hostLastScraped.get(hostname) ?? 0;
+    const elapsed = Date.now() - last;
+    if (elapsed < HOST_COOLDOWN_MS) {
+      const wait = HOST_COOLDOWN_MS - elapsed;
+      console.log(`[COOLDOWN] ${hostname} — waiting ${Math.round(wait / 1000)}s`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+    hostLastScraped.set(hostname, Date.now());
+  } catch {}
+}
+
+// ── Job processor ──────────────────────────────────────────────────────────
 async function processJob(jobId: string): Promise<void> {
   const job = await getJob(jobId);
   if (!job) return;
@@ -38,16 +93,27 @@ async function processJob(jobId: string): Promise<void> {
   try {
     // ── Step 1: Scrape ───────────────────────────────────────────────────
     await updateJob(jobId, { status: 'scraping' });
-    let scrapeResult: ScrapeResult = await limit(() => performScrape(job.url, streamId));
+    await enforceHostCooldown(job.url);
+
+    let scrapeResult: ScrapeResult = await performScrape(job.url, streamId);
 
     if (!scrapeResult?.videos?.length) {
-      console.log(`[JOB:${jobId}] No videos on first attempt, retrying in 60s...`);
-      await new Promise(r => setTimeout(r, 60000));
-      scrapeResult = await limit(() => performScrape(job.url, streamId));
+      console.log(`[JOB:${jobId}] No videos on first attempt, retrying in 30s...`);
+      await new Promise(r => setTimeout(r, 30_000));
+      scrapeResult = await performScrape(job.url, streamId);
     }
 
     if (!scrapeResult?.videos?.length) {
       await updateJob(jobId, { status: 'failed', error: 'No videos found after retry' });
+      return;
+    }
+
+    // Dead video check
+    if ((scrapeResult as any).dead) {
+      await updateJob(jobId, {
+        status: 'failed',
+        error: 'Video has been removed by the uploader',
+      });
       return;
     }
 
@@ -56,11 +122,13 @@ async function processJob(jobId: string): Promise<void> {
 
     // ── Step 2: Store ────────────────────────────────────────────────────
     await updateJob(jobId, { status: 'storing' });
+
     const storageResult = await processAndStoreVideo(
       videoUrl,
       job.title || scrapeResult.title,
       async () => {
         console.log(`[JOB:${jobId}] Token expired — re-scraping...`);
+        await enforceHostCooldown(originalPageUrl);
         const fresh = await performScrape(originalPageUrl, streamId);
         const freshUrl = fresh.videos[0]?.url;
         if (!freshUrl) throw new Error('Re-scrape returned no video URLs');
@@ -98,7 +166,7 @@ async function processJob(jobId: string): Promise<void> {
       },
     });
 
-    console.log(`[JOB:${jobId}] Completed successfully`);
+    console.log(`[JOB:${jobId}] ✓ Completed — queue: ${jobQueue.length} remaining`);
 
   } catch (error: any) {
     console.error(`[JOB:${jobId}] Failed: ${error.message}`);
@@ -107,12 +175,6 @@ async function processJob(jobId: string): Promise<void> {
 }
 
 // ── Routes ─────────────────────────────────────────────────────────────────
-
-/**
- * POST /api/scrape
- * Submit a URL for processing. Returns jobId immediately.
- * Body: { url: string, title?: string }
- */
 app.post('/api/scrape', async (req, res): Promise<any> => {
   const { url, title } = req.body;
 
@@ -122,15 +184,12 @@ app.post('/api/scrape', async (req, res): Promise<any> => {
 
   try {
     const job = await createJob(url, title);
-
-    // Fire and forget
-    processJob(job.jobId).catch((err) => {
-      console.error(`[JOB:${job.jobId}] Unhandled error: ${err.message}`);
-    });
+    await enqueueJob(job.jobId);
 
     return res.status(202).json({
       jobId: job.jobId,
       status: 'pending',
+      queuePosition: jobQueue.length,
       pollUrl: `/api/scrape/status/${job.jobId}`,
     });
   } catch (error: any) {
@@ -138,23 +197,20 @@ app.post('/api/scrape', async (req, res): Promise<any> => {
   }
 });
 
-/**
- * GET /api/scrape/status/:jobId
- * Poll the status of a submitted job.
- */
 app.get('/api/scrape/status/:jobId', async (req, res): Promise<any> => {
   try {
     const job = await getJob(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
 
-    if (!job) {
-      return res.status(404).json({ error: 'Job not found' });
-    }
+    const queuePosition = jobQueue.indexOf(req.params.jobId);
 
     const response: Record<string, any> = {
       jobId: job.jobId,
       status: job.status,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
+      // Show queue position if still waiting (-1 means currently processing or done)
+      queuePosition: queuePosition >= 0 ? queuePosition + 1 : null,
     };
 
     if (job.status === 'done')   response.result = job.result;
@@ -166,10 +222,6 @@ app.get('/api/scrape/status/:jobId', async (req, res): Promise<any> => {
   }
 });
 
-/**
- * GET /api/scrape/jobs
- * List recent jobs.
- */
 app.get('/api/scrape/jobs', async (req, res): Promise<any> => {
   try {
     const allJobs = await listJobs();
@@ -186,6 +238,15 @@ app.get('/api/scrape/jobs', async (req, res): Promise<any> => {
   }
 });
 
+// Queue status endpoint
+app.get('/api/queue', (req, res) => {
+  res.json({
+    isProcessing,
+    pending: jobQueue.length,
+    jobs: jobQueue.map((id, i) => ({ jobId: id, position: i + 1 })),
+  });
+});
+
 // ── Auth ───────────────────────────────────────────────────────────────────
 app.post('/api/login', (req, res): any => {
   const { pin } = req.body;
@@ -194,7 +255,7 @@ app.post('/api/login', (req, res): any => {
   console.log(`[AUTH] Received: "${pin}" | Expected: "${correctPin}"`);
 
   if (!correctPin) {
-    console.error('[AUTH ERROR] DASHBOARD_PIN is not set in Environment Variables!');
+    console.error('[AUTH ERROR] DASHBOARD_PIN is not set');
     return res.status(500).json({ error: 'Server configuration error' });
   }
 
@@ -207,7 +268,6 @@ app.post('/api/login', (req, res): any => {
 // ── Videos gallery ─────────────────────────────────────────────────────────
 app.get('/api/videos', async (req, res): Promise<any> => {
   const authHeader = req.headers['authorization'];
-
   if (authHeader !== process.env.DASHBOARD_PIN) {
     return res.status(403).json({ error: 'Unauthorized access' });
   }
@@ -244,6 +304,20 @@ app.get('/gallery', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
-app.listen(PORT, '0.0.0.0', () =>
-  console.log(`🚀 Server running at http://localhost:${PORT}`)
-);
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
+
+  try {
+    await getDb();
+
+    // R2 multipart cleanup — runs at startup and every 6 hours
+    cleanupIncompleteMultipartUploads().catch(console.error);
+    setInterval(() => {
+      cleanupIncompleteMultipartUploads().catch(console.error);
+    }, 6 * 60 * 60 * 1000);
+
+  } catch (err) {
+    console.error('FATAL: Could not initialize. Process exiting.');
+    process.exit(1);
+  }
+});

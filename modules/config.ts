@@ -14,7 +14,6 @@ function requireEnv(name: string): string {
 }
 
 export const PORT = parseInt(process.env.PORT || '3000', 10);
-export const CONCURRENCY_LIMIT = 1;
 export const USER_DATA_DIR = path.join(os.tmpdir(), 'scraper-profile');
 
 export const BROWSER_ARGS = [
