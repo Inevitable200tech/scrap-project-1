@@ -5,7 +5,7 @@ import { S3Client, DeleteObjectCommand, ListMultipartUploadsCommand, AbortMultip
 import { Upload } from "@aws-sdk/lib-storage";
 import { MongoClient, Db } from "mongodb";
 import crypto from "crypto";
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import { R2_CONFIG, MONGO_URI, MONGO_DB } from "./config.js";
 
 export const s3Client = new S3Client({
@@ -365,6 +365,12 @@ export async function processAndStoreVideo(
     });
 
     // Upload to R2
+    // Sanitize title for metadata header (only alphanumeric, hyphens, underscores)
+    const sanitizedTitle = title
+      .substring(0, 100)
+      .replace(/[^a-zA-Z0-9\-_]/g, '_')  // Replace invalid chars with underscore
+      .replace(/_{2,}/g, '_');            // Replace multiple underscores with single
+
     const upload = new Upload({
       client: s3Client,
       params: {
@@ -372,7 +378,7 @@ export async function processAndStoreVideo(
         Key: r2Key,
         Body: ffmpeg.stdout!,
         ContentType: 'video/mp4',
-        Metadata: { 'original-title': title.substring(0, 100) },
+        Metadata: { 'original-title': sanitizedTitle },
       },
       queueSize: 16,
       partSize: 52428800,
