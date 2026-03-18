@@ -10,9 +10,9 @@
     "dev": "tsx --watch main.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1009.0",
-    "@aws-sdk/lib-storage": "^3.1009.0",
-    "@aws-sdk/s3-request-presigner": "^3.1009.0",
+    "@aws-sdk/client-s3": "^3.893.0",
+    "@aws-sdk/lib-storage": "^3.893.0",
+    "@aws-sdk/s3-request-presigner": "^3.893.0",
     "axios": "^1.13.6",
     "cheerio": "^1.0.0-rc.12",
     "crypto": "^1.0.1",
@@ -24,6 +24,7 @@
     "p-limit": "^7.3.0",
     "playwright": "^1.49.1",
     "playwright-extra": "^3.1.0",
+    "puppeteer-extra-plugin-adblocker": "^2.13.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "devDependencies": {

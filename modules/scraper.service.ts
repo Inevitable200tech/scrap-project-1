@@ -1,8 +1,19 @@
 import playwrightExtra from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+// ADD — handles both CJS default.default and ESM default
+import AdblockerPluginImport from 'puppeteer-extra-plugin-adblocker';
+const AdblockerPlugin = (AdblockerPluginImport as any).default ?? AdblockerPluginImport;
 import { filterVideoUrls } from './utils.js';
 
+// ─── Plugin Registration ───────────────────────────────────────────────────────
 playwrightExtra.chromium.use(StealthPlugin());
+playwrightExtra.chromium.use(
+  AdblockerPlugin({
+    blockTrackers: true,
+    blockTrackersAndAds: true,
+    useCache: true,
+  })
+);
 
 export interface ScrapeResult {
   title: string;
@@ -12,23 +23,65 @@ export interface ScrapeResult {
   deadReason?: string;
 }
 
+// ─── Aggressive ad/pop-up/overlay block patterns ──────────────────────────────
+// Second layer on top of the adblocker plugin — aborted at Playwright route level.
+const BLOCKED_URL_PATTERNS: RegExp[] = [
+  /doubleclick\.net/i, /googlesyndication\.com/i, /adnxs\.com/i,
+  /adsystem\.com/i, /amazon-adsystem\.com/i, /outbrain\.com/i,
+  /taboola\.com/i, /adsbygoogle/i, /pagead\/js/i,
+  /adserver/i, /adservice/i, /adskeeper/i,
+  /adform\.net/i, /advertising\.com/i, /pubmatic\.com/i,
+  /rubiconproject\.com/i, /openx\.net/i, /criteo\.com/i,
+  /moatads\.com/i, /casalemedia\.com/i, /contextweb\.com/i,
+  /lijit\.com/i, /servedby/i, /adsafeprotected\.com/i,
+  /exoclick\.com/i, /trafficjunky\.net/i, /plugrush\.com/i,
+  /juicyads\.com/i, /ero-advertising\.com/i, /traffichunt\.com/i,
+  /hilltopads\.net/i, /popcash\.net/i, /popads\.net/i,
+  /propellerads\.com/i, /adcash\.com/i, /yllix\.com/i,
+  /bidvertiser\.com/i, /revcontent\.com/i, /mgid\.com/i,
+  /zedo\.com/i, /undertone\.com/i, /spotxchange\.com/i,
+  /spotx\.tv/i, /freewheel\.tv/i, /yieldmo\.com/i,
+  /smartadserver\.com/i, /33across\.com/i, /sovrn\.com/i,
+  /sharethrough\.com/i, /triplelift\.com/i, /appnexus\.com/i,
+  /mediamath\.com/i, /indexexchange\.com/i, /adfox\.ru/i,
+  /yandex.*?ad/i, /dtscout\.com/i, /dtscdn\.com/i,
+  // Pop-under/click-under scripts
+  /popunder/i, /pop-under/i, /clickunder/i,
+  /click\.php/i, /go\.php\?/i, /redirect\.php/i,
+  /track\.php/i, /counter\.php/i, /visit\.php/i,
+  /\bpop\b.*?\.js/i,
+  // Analytics/tracking (safe to block, won't affect video)
+  /google-analytics\.com/i, /googletagmanager\.com/i,
+  /analytics\.js/i, /pixel\.js/i, /mc\.yandex\.ru/i,
+  /hotjar\.com/i, /mixpanel\.com/i, /segment\.com/i,
+  /amplitude\.com/i, /clarity\.ms/i, /mouseflow\.com/i,
+  /fullstory\.com/i, /logrocket\.com/i,
+];
+
+// DOM selectors for ad overlays/popups to nuke after page load
+const AD_OVERLAY_SELECTORS = [
+  '[id*="overlay"]', '[class*="overlay"]',
+  '[id*="popup"]',   '[class*="popup"]',
+  '[id*="modal"]',   '[class*="modal"]',
+  '[id*="banner"]',  '[class*="banner"]',
+  '[id*="interstitial"]', '[class*="interstitial"]',
+  '[id*="preroll"]', '[class*="preroll"]',
+  'iframe[src*="ad"]', 'iframe[src*="pop"]', 'iframe[id*="ad"]',
+  '#ad', '#ads', '.ad', '.ads', '.ad-container', '.ad-wrapper',
+  '.advertisement', '.advert', '#advertisement',
+  '#overlay', '.overlay-container', '.video-overlay',
+  '[class*="adblock"]', '[id*="adblock"]',
+  '[id*="consent"]', '[class*="consent"]',
+  '[id*="cookie"]',  '[class*="cookie"]',
+  '[id*="gdpr"]',    '[class*="gdpr"]',
+];
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 function log(streamId: string, message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO') {
   const ts = new Date().toISOString();
   const prefix = `[${ts}] [ID: ${streamId}] [${level}]`;
   console[level.toLowerCase() as 'log' | 'warn' | 'error'](`${prefix} ${message}`);
-}
-
-class PageAliveChecker {
-  private lastCheck = 0;
-  private cached = true;
-
-  check(p: any): boolean {
-    try {
-      return p && !p.isClosed?.();
-    } catch {
-      return false;
-    }
-  }
 }
 
 const DEAD_VIDEO_SIGNALS = [
@@ -50,25 +103,69 @@ const DEAD_VIDEO_SIGNALS = [
 
 function detectDeadVideo(httpStatus: number, html: string): string | null {
   if (httpStatus === 404 || httpStatus === 410) return `HTTP ${httpStatus}`;
-
   const bodyOnly = html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
     .replace(/<style[\s\S]*?<\/style>/gi, '');
-
   for (const pattern of DEAD_VIDEO_SIGNALS) {
     if (pattern.test(bodyOnly)) return pattern.source;
   }
   return null;
 }
 
-// Timeout wrapper for cleaner async operations
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, defaultValue: T): Promise<T> {
   return Promise.race([
     promise,
-    new Promise<T>(resolve => setTimeout(() => resolve(defaultValue), timeoutMs))
+    new Promise<T>(resolve => setTimeout(() => resolve(defaultValue), timeoutMs)),
   ]);
 }
 
+// ─── Layer 5: Aggressive DOM ad/overlay removal ───────────────────────────────
+async function nukeAdOverlays(page: any, streamId: string): Promise<void> {
+  if (!page || page.isClosed?.()) return;
+  try {
+    await withTimeout(
+      page.evaluate((selectors: string[]) => {
+        // Remove known ad/overlay selectors
+        for (const sel of selectors) {
+          try { document.querySelectorAll(sel).forEach(el => el.remove()); }
+          catch { /* ignore bad selectors */ }
+        }
+
+        // Force-remove any fixed/absolute full-screen overlays (z-index > 100)
+        document.querySelectorAll('*').forEach(el => {
+          try {
+            const style = window.getComputedStyle(el);
+            const isOverlay =
+              (style.position === 'fixed' || style.position === 'absolute') &&
+              parseInt(style.zIndex || '0', 10) > 100 &&
+              el.tagName !== 'VIDEO' &&
+              !(el as HTMLElement).closest?.('video');
+            if (isOverlay) {
+              const rect = (el as HTMLElement).getBoundingClientRect();
+              if (rect.width > window.innerWidth * 0.7 && rect.height > window.innerHeight * 0.7) {
+                (el as HTMLElement).remove();
+              }
+            }
+          } catch { /* ignore */ }
+        });
+
+        // Patch window.open after load (belt-and-suspenders alongside initScript)
+        (window as any).open = () => null;
+        (window as any).showAd    = () => null;
+        (window as any).displayAd = () => null;
+        (window as any).popUnder  = () => null;
+        (window as any).popunder  = () => null;
+      }, AD_OVERLAY_SELECTORS),
+      3000,
+      undefined
+    );
+    log(streamId, 'Ad overlays nuked');
+  } catch (e: any) {
+    log(streamId, `Overlay nuke failed: ${e.message}`, 'WARN');
+  }
+}
+
+// ─── Debug dump ───────────────────────────────────────────────────────────────
 async function dumpPageDebugInfo(
   page: any,
   streamId: string,
@@ -78,34 +175,20 @@ async function dumpPageDebugInfo(
     log(streamId, '[DEBUG] Page unavailable for debug info', 'WARN');
     return;
   }
-
   try {
     const debugInfo = await withTimeout(
       page.evaluate(() => {
         const clone = document.body.cloneNode(true) as HTMLElement;
         clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
         const visibleText = (clone.innerText || clone.textContent || '')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .substring(0, 10000);
-
-        const allLinks = Array.from(document.querySelectorAll('a[href]'))
-          .map(a => (a as HTMLAnchorElement).href)
-          .filter(h => h.startsWith('http'))
-          .slice(0, 20);
-
+          .replace(/\s+/g, ' ').trim().substring(0, 10000);
         const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
-          src: f.src || f.getAttribute('src'),
-          id: f.id,
+          src: f.src || f.getAttribute('src'), id: f.id,
         }));
-
         const videos = Array.from(document.querySelectorAll('video')).map(v => ({
-          src: v.src,
-          currentSrc: v.currentSrc,
-          srcAttribute: v.getAttribute('src'),
-          readyState: v.readyState,
+          src: v.src, currentSrc: v.currentSrc,
+          srcAttribute: v.getAttribute('src'), readyState: v.readyState,
         }));
-
         const errorSelectors = [
           '.error', '.message', '.alert', '.notice',
           '[class*="error"]', '[class*="empty"]', '[class*="not-found"]',
@@ -115,46 +198,36 @@ async function dumpPageDebugInfo(
         const errorTexts: Record<string, string> = {};
         for (const sel of errorSelectors) {
           const el = document.querySelector(sel);
-          if (el) {
-            const text = el.textContent?.trim().substring(0, 100);
-            if (text) errorTexts[sel] = text;
-          }
+          if (el) { const t = el.textContent?.trim().substring(0, 100); if (t) errorTexts[sel] = t; }
         }
-
-        return { visibleText, allLinks, iframes, videos, errorTexts };
+        return { visibleText, iframes, videos, errorTexts };
       }),
       5000,
-      { visibleText: '', allLinks: [], iframes: [], videos: [], errorTexts: {} }
+      { visibleText: '', iframes: [], videos: [], errorTexts: {} }
     );
-
     log(streamId, `[DEBUG] ── No video found – page dump ──`, 'WARN');
     log(streamId, `[DEBUG] Intercepted requests: ${interceptedCount}`, 'WARN');
-    if (debugInfo.visibleText) {
+    if (debugInfo.visibleText)
       log(streamId, `[DEBUG] Visible text: ${debugInfo.visibleText.substring(0, 200)}`, 'WARN');
-    }
-    if (debugInfo.videos.length > 0) {
+    if (debugInfo.videos.length > 0)
       log(streamId, `[DEBUG] Video elements: ${JSON.stringify(debugInfo.videos)}`, 'WARN');
-    }
-    if (Object.keys(debugInfo.errorTexts).length > 0) {
+    if (Object.keys(debugInfo.errorTexts).length > 0)
       log(streamId, `[DEBUG] Error texts: ${JSON.stringify(debugInfo.errorTexts)}`, 'WARN');
-    }
   } catch (e: any) {
     log(streamId, `[DEBUG] Dump failed: ${e.message}`, 'WARN');
   }
 }
 
+// ─── Site-specific extractors ─────────────────────────────────────────────────
+
 function resolveVidaraEmbedUrl(url: string): string {
   try {
     const parsed = new URL(url);
-    if (parsed.hostname.includes('vidara.so') && parsed.pathname.startsWith('/e/')) {
-      return url;
-    }
+    if (parsed.hostname.includes('vidara.so') && parsed.pathname.startsWith('/e/')) return url;
     const segments = parsed.pathname.split('/').filter(Boolean);
     const filecode = segments[0] === 'v' ? segments[1] : segments[0];
     return `https://vidara.so/e/${filecode}`;
-  } catch {
-    return url;
-  }
+  } catch { return url; }
 }
 
 async function extractVidaraUrl(page: any, streamId: string): Promise<string | null> {
@@ -168,59 +241,36 @@ async function extractVidaraUrl(page: any, streamId: string): Promise<string | n
         const sources = p.getPlaylist?.()?.[0]?.sources ?? [];
         const valid = sources.find((s: any) => s.file && !s.file.startsWith('blob:'));
         return valid?.file ?? null;
-      } catch {
-        return null;
-      }
+      } catch { return null; }
     }),
-    3000,
-    null
+    3000, null
   );
 }
 
 async function extractVidnestUrl(page: any, streamId: string): Promise<string | null> {
   try {
     const playSelector = '.jw-video, .jw-display-icon-container, video';
-    await withTimeout(
-      page.click(playSelector, { force: true, timeout: 5000 }),
-      5500,
-      undefined
-    );
+    await withTimeout(page.click(playSelector, { force: true, timeout: 5000 }), 5500, undefined);
     await new Promise(resolve => setTimeout(resolve, 1200));
-
     return withTimeout(
       page.evaluate(() => {
-        try {
-          return (window as any).jwplayer?.()?.getPlaylist?.()?.[0]?.file ?? null;
-        } catch {
-          return null;
-        }
+        try { return (window as any).jwplayer?.()?.getPlaylist?.()?.[0]?.file ?? null; }
+        catch { return null; }
       }),
-      2000,
-      null
+      2000, null
     );
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
 async function extractVidsonicUrl(page: any, streamId: string): Promise<string | null> {
   try {
     await withTimeout(
-      page.evaluate(() => {
-        document.querySelector('.vjs-vast-label')?.remove();
-      }),
-      1000,
-      undefined
+      page.evaluate(() => { document.querySelector('.vjs-vast-label')?.remove(); }),
+      1000, undefined
     );
-
     const playSelector = '.vjs-big-play-button, .vjs-play-control';
-    await withTimeout(
-      page.click(playSelector, { force: true, timeout: 5000 }),
-      5500,
-      undefined
-    );
+    await withTimeout(page.click(playSelector, { force: true, timeout: 5000 }), 5500, undefined);
     await new Promise(resolve => setTimeout(resolve, 1200));
-
     const vjsSource = await withTimeout(
       page.evaluate(() => {
         try {
@@ -229,47 +279,73 @@ async function extractVidsonicUrl(page: any, streamId: string): Promise<string |
           if ((window as any).videojs) {
             const players = (window as any).videojs.getPlayers?.();
             if (players) {
-              const firstPlayer = Object.values(players)[0];
-              return firstPlayer ? (firstPlayer as any).src() : null;
+              const first = Object.values(players)[0];
+              return first ? (first as any).src() : null;
             }
           }
           return null;
-        } catch {
-          return null;
-        }
+        } catch { return null; }
       }),
-      2000,
-      null
+      2000, null
     );
-
     return vjsSource && !String(vjsSource).startsWith('blob:') ? vjsSource : null;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-// ✅ FIXED: Wait for Streamtape lazy-loading
 async function extractStreamtapeUrl(page: any, streamId: string): Promise<string | null> {
   try {
-    const videoUrl = await page.evaluate(() => {
-      const video = document.querySelector('video');
-      if (!video) return null;
-      
-      const src = video.src || video.currentSrc || video.getAttribute('src');
-      if (src && src.length > 0 && !src.startsWith('blob:')) {
-        return src.startsWith('//') ? 'https:' + src : src;
-      }
-      return null;
-    });
+    await withTimeout(page.waitForSelector('video', { timeout: 12000 }), 12500, undefined);
+    await new Promise(resolve => setTimeout(resolve, 1500));
 
+    // Attempt 1: <video> src / currentSrc
+    let videoUrl: string | null = await withTimeout(
+      (page.evaluate(() => {
+        const video = document.querySelector('video') as HTMLVideoElement | null;
+        if (!video) return null;
+        const src = video.src || video.currentSrc || video.getAttribute('src') || '';
+        return src && !src.startsWith('blob:') ? src : null;
+      }) as Promise<string | null>),
+      3000,
+      null as string | null
+    );
     if (videoUrl) {
       log(streamId, `Streamtape: ✅ Found video URL from <video> tag`);
-      return videoUrl;
+      return videoUrl.startsWith('//') ? 'https:' + videoUrl : videoUrl;
     }
 
-    log(streamId, 'Streamtape: ❌ No video URL found');
-    return null;
+    // Attempt 2: <source> children
+    videoUrl = await withTimeout(
+      (page.evaluate(() => {
+        const sources = Array.from(document.querySelectorAll('video source'));
+        for (const s of sources) {
+          const src = (s as HTMLSourceElement).src || s.getAttribute('src') || '';
+          if (src && !src.startsWith('blob:')) return src;
+        }
+        return null;
+      }) as Promise<string | null>),
+      2000,
+      null as string | null
+    );
+    if (videoUrl) {
+      log(streamId, `Streamtape: ✅ Found video URL from <source> tag`);
+      return videoUrl.startsWith('//') ? 'https:' + videoUrl : videoUrl;
+    }
 
+    // Attempt 3: window globals some Streamtape variants expose
+    const intercepted: string | null = await withTimeout(
+      (page.evaluate(() =>
+        (window as any).__streamtape_src || (window as any).videoUrl || null
+      ) as Promise<string | null>),
+      1500,
+      null as string | null
+    );
+    if (intercepted) {
+      log(streamId, `Streamtape: ✅ Found video URL from window global`);
+      return intercepted;
+    }
+
+    log(streamId, 'Streamtape: ❌ No video URL found after all attempts', 'WARN');
+    return null;
   } catch (error: any) {
     log(streamId, `Streamtape extraction error: ${error.message}`, 'WARN');
     return null;
@@ -279,17 +355,12 @@ async function extractStreamtapeUrl(page: any, streamId: string): Promise<string
 async function extractGenericVideoUrl(page: any, streamId: string): Promise<string | null> {
   try {
     const playSelector = '.plyr__control--overlaid, .play-overlay, button[data-plyr="play"]';
-    await withTimeout(
-      page.waitForSelector(playSelector, { timeout: 8000 }),
-      8500,
-      undefined
-    );
+    await withTimeout(page.waitForSelector(playSelector, { timeout: 8000 }), 8500, undefined);
     await page.click(playSelector, { force: true }).catch(() => {});
     await new Promise(resolve => setTimeout(resolve, 1000));
   } catch {
     log(streamId, 'Generic play element not found', 'WARN');
   }
-
   return withTimeout(
     page.evaluate(() => {
       const video = document.querySelector('video') as HTMLVideoElement | null;
@@ -297,8 +368,7 @@ async function extractGenericVideoUrl(page: any, streamId: string): Promise<stri
       const src = video.currentSrc || video.src || '';
       return src && !src.startsWith('blob:') ? src : null;
     }),
-    2000,
-    null
+    2000, null
   );
 }
 
@@ -310,15 +380,16 @@ async function extractDOMVideo(page: any): Promise<string | null> {
       const src = video.currentSrc || video.src || '';
       return src && !src.startsWith('blob:') ? src : null;
     }),
-    1500,
-    null
+    1500, null
   );
 }
 
+// ─── Main scrape entry point ───────────────────────────────────────────────────
+
 export async function performScrape(url: string, streamId: string): Promise<ScrapeResult> {
-  const isVidara = /vidara\./i.test(url);
-  const isVidsonic = /vidsonic\./i.test(url);
-  const isVidnest = /vidnest\./i.test(url);
+  const isVidara     = /vidara\./i.test(url);
+  const isVidsonic   = /vidsonic\./i.test(url);
+  const isVidnest    = /vidnest\./i.test(url);
   const isStreamtape = /streamtape\./i.test(url);
 
   const targetUrl = isVidara ? resolveVidaraEmbedUrl(url) : url;
@@ -329,7 +400,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
   const scrapeAttempt = async (): Promise<ScrapeResult> => {
     let browser: any = null;
     let context: any = null;
-    let page: any = null;
+    let page: any    = null;
     const interceptedVideos: { site: string; url: string }[] = [];
 
     try {
@@ -343,6 +414,8 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           '--disable-infobars',
           '--window-size=1280,900',
           '--disable-blink-features=AutomationControlled',
+          '--block-new-web-contents',   // suppress new windows/tabs at Chromium level
+          '--disable-component-extensions-with-background-pages',
         ],
       });
 
@@ -355,44 +428,90 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       page = await context.newPage();
       log(streamId, 'Page opened');
 
-      // Network interceptor - catch videos early
+      // ── Layer 4: Patch window.open + ad globals BEFORE any page JS runs ───────
+      await page.addInitScript(() => {
+        // Seal window.open so pop-unders can't open new tabs/windows
+        window.open = () => null as any;
+        try {
+          Object.defineProperty(window, 'open', { value: () => null, writable: false });
+        } catch { /* already sealed or strict mode */ }
+
+        // Neutralise common ad bootstrap globals
+        (window as any).popUnder  = () => null;
+        (window as any).popunder  = () => null;
+        (window as any).showAd    = () => null;
+        (window as any).loadAd    = () => null;
+        (window as any).displayAd = () => null;
+
+        // Block runtime ad-script injection via createElement override
+        const _createElement = document.createElement.bind(document);
+        (document as any).createElement = function (tag: string, ...args: any[]) {
+          const el = _createElement(tag, ...args);
+          if (tag.toLowerCase() === 'script') {
+            const _setAttr = el.setAttribute.bind(el);
+            el.setAttribute = function (name: string, value: string) {
+              if (name === 'src') {
+                const blocked = [
+                  'popads', 'popcash', 'popunder', 'exoclick',
+                  'trafficjunky', 'adcash', 'hilltopads', 'propellerads',
+                  'plugrush', 'juicyads', 'adform', 'adnxs',
+                  'dtscout', 'dtscdn',
+                ];
+                if (blocked.some(b => value.includes(b))) {
+                  console.warn(`[AdBlock-init] Blocked script injection: ${value}`);
+                  return;
+                }
+              }
+              _setAttr(name, value);
+            };
+          }
+          return el;
+        };
+      });
+
+      // ── Layer 1: Playwright route interception (network-level block) ──────────
+      await page.route('**/*', async (route: any) => {
+        const reqUrl: string = route.request().url();
+        if (BLOCKED_URL_PATTERNS.some(p => p.test(reqUrl))) {
+          await route.abort('blockedbyclient');
+          return;
+        }
+        await route.continue();
+      });
+
+      // ── Layer 2: Network video sniffer ────────────────────────────────────────
       page.on('request', (request: { url: () => string }) => {
         const reqUrl = request.url();
-        const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)|dtscout|dtscdn|doubleclick|adnxs|adsystem|googlesyndication|amazon-adsystem|outbrain|taboola|adsbygoogle/i.test(reqUrl);
-
         if (
-          !isBlacklisted &&
-          (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4'))
+          (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4')) &&
+          reqUrl !== url &&
+          !interceptedVideos.some(v => v.url === reqUrl)
         ) {
-          if (reqUrl !== url && !interceptedVideos.some(v => v.url === reqUrl)) {
-            log(streamId, `VIDEO: ${reqUrl.substring(0, 80)}...`);
-            interceptedVideos.push({ site: 'Network-Sniffer', url: reqUrl });
-          }
+          log(streamId, `VIDEO INTERCEPTED: ${reqUrl.substring(0, 80)}...`);
+          interceptedVideos.push({ site: 'Network-Sniffer', url: reqUrl });
         }
       });
 
       page.on('close', () => log(streamId, 'Page closed', 'WARN'));
       page.on('console', (msg: any) => {
-        if (msg.type() === 'error') {
-          log(streamId, `JS Error: ${msg.text()}`, 'WARN');
-        }
+        if (msg.type() === 'error') log(streamId, `JS Error: ${msg.text()}`, 'WARN');
       });
 
-      // Popup handler
+      // ── Layer 3: Popup / new-tab suppression ──────────────────────────────────
       context.on('page', async (popup: any) => {
         if (popup === page) return;
         try {
-          await new Promise(r => setTimeout(r, 500));
+          await new Promise(r => setTimeout(r, 300));
           if (!popup.isClosed?.()) await popup.close({ runBeforeUnload: false }).catch(() => {});
+          log(streamId, 'Popup suppressed');
         } catch (e: any) {
           log(streamId, `Popup handler error: ${e.message}`, 'WARN');
         }
       });
 
-      // Navigation with early dead video detection
+      // Navigation
       let httpStatus = 200;
       log(streamId, `Navigating to: ${targetUrl}`);
-      
       await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 35000 })
         .then((response: any) => {
           httpStatus = response?.status() ?? 200;
@@ -402,30 +521,20 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           log(streamId, `Navigation error: ${e.message}`, 'WARN');
         });
 
-      if (!page || page.isClosed?.()) {
-        throw new Error('Page closed after navigation');
-      }
+      if (!page || page.isClosed?.()) throw new Error('Page closed after navigation');
 
-      // Check for dead video immediately after navigation
-      const pageHtml = await withTimeout(
-        page.content(),
-        5000,
-        ''
-      );
+      // ── Layer 5: DOM nuke after load ──────────────────────────────────────────
+      await nukeAdOverlays(page, streamId);
 
+      // Dead video check
+      const pageHtml = await withTimeout(page.content(), 5000, '');
       const deadReason = detectDeadVideo(httpStatus, pageHtml);
       if (deadReason) {
         log(streamId, `Dead video: ${deadReason}`, 'WARN');
-        return {
-          title: 'Dead Video',
-          originalUrl: url,
-          videos: [],
-          dead: true,
-          deadReason,
-        };
+        return { title: 'Dead Video', originalUrl: url, videos: [], dead: true, deadReason };
       }
 
-      // Parallel extraction based on site type
+      // ── Site-specific extraction ───────────────────────────────────────────────
       if (isVidara) {
         log(streamId, 'Vidara JW Player extraction');
         const vidaraUrl = await extractVidaraUrl(page, streamId);
@@ -472,12 +581,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       }
 
-      const title = await withTimeout(
-        page.title(),
-        2000,
-        'Unknown Title'
-      );
-
+      const title = await withTimeout(page.title(), 2000, 'Unknown Title');
       log(streamId, `Title: ${title}`);
       log(streamId, `Found ${interceptedVideos.length} video URLs`);
 
@@ -495,10 +599,8 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
 
     } catch (error: any) {
       log(streamId, `FAILED: ${error.message || 'Unknown error'}`, 'ERROR');
-
       await context?.close().catch(() => {});
       await browser?.close().catch(() => {});
-
       throw error;
     }
   };
