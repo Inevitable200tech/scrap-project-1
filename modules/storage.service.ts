@@ -1,5 +1,5 @@
 // storage.service.ts
-import { S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, DeleteObjectCommand, ListMultipartUploadsCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { MongoClient, Db, ObjectId } from "mongodb";
 import crypto from "crypto";
@@ -21,8 +21,6 @@ export async function getDb() {
     await mongoClient.connect();
     db = mongoClient.db(MONGO_DB);
 
-    // ── Indexes ──────────────────────────────────────────────────────────
-    // TTL index: auto-delete jobs older than 2 hours
     await db.collection('jobs').createIndex(
       { createdAt: 1 },
       { expireAfterSeconds: 7200 }
@@ -129,10 +127,6 @@ function getUrlSecondsRemaining(videoUrl: string): number {
   }
 }
 
-/**
- * Returns the Referer and Origin headers for a given video CDN URL.
- * FFmpeg needs these to pass CDN access checks.
- */
 function getSiteOrigin(videoUrl: string): { referer: string; origin: string } {
   if (/vidsonic/i.test(videoUrl))   return { referer: 'https://vidsonic.net/',        origin: 'https://vidsonic.net' };
   if (/vidara/i.test(videoUrl))     return { referer: 'https://vidara.so/',            origin: 'https://vidara.so' };
@@ -145,6 +139,77 @@ function getSiteOrigin(videoUrl: string): { referer: string; origin: string } {
   } catch {
     return { referer: '', origin: '' };
   }
+}
+
+// ── Multipart upload cleanup ───────────────────────────────────────────────
+
+/**
+ * Aborts all incomplete multipart uploads in the R2 bucket that are older
+ * than `olderThanMs` milliseconds (default: 1 hour).
+ *
+ * These accumulate when FFmpeg fails mid-upload (TLS rejection, OOM, crash).
+ * They consume storage quota without appearing as real objects in the bucket.
+ *
+ * Call this periodically from main.ts — once per hour is sufficient.
+ */
+export async function cleanupIncompleteMultipartUploads(
+  olderThanMs = 60 * 60 * 1000 // 1 hour
+): Promise<{ aborted: number; errors: number }> {
+  console.log('[R2 CLEANUP] Scanning for incomplete multipart uploads...');
+
+  let aborted = 0;
+  let errors = 0;
+  let isTruncated = true;
+  let keyMarker: string | undefined;
+  let uploadIdMarker: string | undefined;
+
+  while (isTruncated) {
+    let response;
+    try {
+      response = await s3Client.send(new ListMultipartUploadsCommand({
+        Bucket: R2_CONFIG.bucket,
+        KeyMarker: keyMarker,
+        UploadIdMarker: uploadIdMarker,
+      }));
+    } catch (err: any) {
+      console.error(`[R2 CLEANUP] Failed to list multipart uploads: ${err.message}`);
+      break;
+    }
+
+    const uploads = response.Uploads ?? [];
+    const cutoff = Date.now() - olderThanMs;
+
+    for (const upload of uploads) {
+      const { Key, UploadId, Initiated } = upload;
+
+      // Only abort uploads older than the cutoff
+      // — skip very recent ones that might still be in progress
+      if (Initiated && Initiated.getTime() > cutoff) {
+        console.log(`[R2 CLEANUP] Skipping recent upload: ${Key} (started ${Initiated.toISOString()})`);
+        continue;
+      }
+
+      try {
+        await s3Client.send(new AbortMultipartUploadCommand({
+          Bucket: R2_CONFIG.bucket,
+          Key: Key!,
+          UploadId: UploadId!,
+        }));
+        console.log(`[R2 CLEANUP] Aborted: ${Key} | UploadId: ${UploadId} | Started: ${Initiated?.toISOString()}`);
+        aborted++;
+      } catch (err: any) {
+        console.error(`[R2 CLEANUP] Failed to abort ${Key} (${UploadId}): ${err.message}`);
+        errors++;
+      }
+    }
+
+    isTruncated = response.IsTruncated ?? false;
+    keyMarker = response.NextKeyMarker;
+    uploadIdMarker = response.NextUploadIdMarker;
+  }
+
+  console.log(`[R2 CLEANUP] Done — Aborted: ${aborted} | Errors: ${errors}`);
+  return { aborted, errors };
 }
 
 export async function processAndStoreVideo(
@@ -179,10 +244,6 @@ export async function processAndStoreVideo(
     const hash = crypto.createHash('sha256');
     const r2Key = `videos/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.mp4`;
 
-    // ── Build browser-like headers for FFmpeg ──────────────────────────────
-    // Passed via -headers for both HLS and direct MP4.
-    // This bypasses TLS fingerprint checks on CDNs like boodstream and vidsonic
-    // that reject non-browser http clients (including Node's built-in http).
     const { referer, origin } = getSiteOrigin(videoUrl);
     const headerString = [
       'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -194,11 +255,6 @@ export async function processAndStoreVideo(
 
     console.log(`[STORAGE] ${isM3U8 ? 'HLS' : 'Direct MP4'} — FFmpeg fetching with browser headers: ${videoUrl.substring(0, 80)}...`);
 
-    // ── FFmpeg — unified approach for HLS and direct MP4 ──────────────────
-    // Both pass the URL directly to FFmpeg with -headers + -tls_verify 0.
-    // The old pipe:0 approach is removed — it broke for any CDN doing TLS
-    // fingerprinting (boodstream, vidsonic) because Node's http client
-    // doesn't look like a browser at the TLS layer.
     const ffmpegArgs = [
       '-headers', headerString,
       '-tls_verify', '0',
@@ -209,7 +265,6 @@ export async function processAndStoreVideo(
       '-crf', '32',
       '-preset', 'ultrafast',
       '-b:v', '500k',
-      // HLS-only bitrate caps
       ...(isM3U8 ? ['-maxrate', '600k', '-bufsize', '1000k'] : []),
       '-c:a', 'aac',
       '-b:a', '64k',
@@ -229,7 +284,6 @@ export async function processAndStoreVideo(
       if (msg.includes('Error')) console.error(`[FFMPEG]: ${msg}`);
     });
 
-    // Track bytes received to detect empty output before wasting R2 storage
     let bytesReceived = 0;
     videoSource.on('data', (chunk: Buffer) => {
       hash.update(chunk);
@@ -251,9 +305,6 @@ export async function processAndStoreVideo(
 
     await upload.done();
 
-    // ── Empty output guard ─────────────────────────────────────────────────
-    // If FFmpeg produced 0 bytes the CDN rejected the request (TLS or auth).
-    // Delete the empty R2 object and return a failure so the job can retry.
     if (bytesReceived === 0) {
       console.error(`[STORAGE] FFmpeg produced 0 bytes — CDN likely rejected the request`);
       await deleteFromR2(r2Key);
