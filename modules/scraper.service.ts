@@ -248,30 +248,60 @@ async function extractVidsonicUrl(page: any, streamId: string): Promise<string |
   }
 }
 
+// ✅ FIXED: Wait for Streamtape lazy-loading
 async function extractStreamtapeUrl(page: any, streamId: string): Promise<string | null> {
-  return withTimeout(
-    page.evaluate(() => {
-      try {
-        const norobotEl = document.getElementById('norobotlink');
-        if (norobotEl) {
-          let href = norobotEl.textContent?.trim() || '';
-          if (href.startsWith('//')) return 'https:' + href;
-          if (href.startsWith('https://')) return href;
+  try {
+    // CRITICAL FIX: Wait for the video element's src to be populated
+    // Streamtape lazy-loads the player, so the video element exists but src is empty initially
+    // We need to wait 2-3 seconds for JavaScript to populate the src attribute
+    log(streamId, 'Waiting for Streamtape video player to load...');
+    
+    await withTimeout(
+      page.waitForFunction(
+        () => {
+          const video = document.querySelector('video') as HTMLVideoElement | null;
+          if (!video) return false;
+          // Check if src is populated (either directly or via currentSrc)
+          const hasSrc = !!(video.src || video.currentSrc || video.getAttribute('src'));
+          return hasSrc;
+        },
+        { timeout: 5000 }
+      ),
+      5500,
+      undefined
+    ).catch(() => {});
+
+    return withTimeout(
+      page.evaluate(() => {
+        try {
+          // Try norobotlink first (direct download link)
+          const norobotEl = document.getElementById('norobotlink');
+          if (norobotEl) {
+            let href = norobotEl.textContent?.trim() || '';
+            if (href.startsWith('//')) return 'https:' + href;
+            if (href.startsWith('https://')) return href;
+          }
+
+          // Then try video element (player link)
+          const video = document.querySelector('video') as HTMLVideoElement | null;
+          if (video) {
+            let src = video.getAttribute('src') || video.src || video.currentSrc || '';
+            if (src && src.startsWith('//')) return 'https:' + src;
+            if (src && src.startsWith('https://')) return src;
+          }
+
+          return null;
+        } catch {
+          return null;
         }
-        const video = document.querySelector('video');
-        if (video) {
-          let src = video.getAttribute('src') || '';
-          if (src.startsWith('//')) return 'https:' + src;
-          if (src.startsWith('https://')) return src;
-        }
-        return null;
-      } catch {
-        return null;
-      }
-    }),
-    2000,
-    null
-  );
+      }),
+      2000,
+      null
+    );
+  } catch (error: any) {
+    log(streamId, `Streamtape extraction error: ${error.message}`, 'WARN');
+    return null;
+  }
 }
 
 async function extractGenericVideoUrl(page: any, streamId: string): Promise<string | null> {
