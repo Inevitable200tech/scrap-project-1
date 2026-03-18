@@ -11,7 +11,7 @@
     </style>
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen p-4 md:p-8 font-sans">
-    
+
     <div id="lock-screen" class="fixed inset-0 bg-gray-950 z-50 flex items-center justify-center">
         <div class="bg-gray-900 p-8 rounded-2xl border border-gray-800 shadow-2xl w-full max-w-md text-center">
             <h2 class="text-3xl font-bold mb-6 text-white">🔐 Access Vault</h2>
@@ -23,7 +23,7 @@
     </div>
 
     <div class="max-w-7xl mx-auto">
-        <header class="mb-10 border-b border-gray-800 pb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+        <header class="mb-6 border-b border-gray-800 pb-6 flex flex-col md:flex-row justify-between items-center gap-4">
             <div>
                 <h1 class="text-4xl font-bold text-white mb-2">📼 Video Vault</h1>
                 <p class="text-gray-400">Encrypted Personal Media Archive</p>
@@ -34,23 +34,82 @@
             </div>
         </header>
 
-        <div id="video-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 pb-20">
+        <!-- ── Filter bar ──────────────────────────────────────────────── -->
+        <div class="mb-8 bg-gray-800 border border-gray-700 rounded-xl p-4 flex flex-col md:flex-row gap-4 items-end">
+
+            <!-- Date range -->
+            <div class="flex flex-col gap-1 flex-1">
+                <label class="text-xs uppercase tracking-wider text-gray-400">Date from</label>
+                <input type="date" id="filter-date-from"
+                       class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
             </div>
+            <div class="flex flex-col gap-1 flex-1">
+                <label class="text-xs uppercase tracking-wider text-gray-400">Date to</label>
+                <input type="date" id="filter-date-to"
+                       class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
+            </div>
+
+            <!-- Size range -->
+            <div class="flex flex-col gap-1 flex-1">
+                <label class="text-xs uppercase tracking-wider text-gray-400">Min size (MB)</label>
+                <input type="number" id="filter-size-min" placeholder="0" min="0"
+                       class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
+            </div>
+            <div class="flex flex-col gap-1 flex-1">
+                <label class="text-xs uppercase tracking-wider text-gray-400">Max size (MB)</label>
+                <input type="number" id="filter-size-max" placeholder="∞" min="0"
+                       class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
+            </div>
+
+            <!-- Sort -->
+            <div class="flex flex-col gap-1 flex-1">
+                <label class="text-xs uppercase tracking-wider text-gray-400">Sort by</label>
+                <select id="filter-sort"
+                        class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
+                    <option value="date-desc">Newest first</option>
+                    <option value="date-asc">Oldest first</option>
+                    <option value="size-desc">Largest first</option>
+                    <option value="size-asc">Smallest first</option>
+                </select>
+            </div>
+
+            <!-- Actions -->
+            <div class="flex gap-2">
+                <button onclick="applyFilters()"
+                        class="bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2 rounded-lg font-semibold transition text-sm whitespace-nowrap">
+                    Apply
+                </button>
+                <button onclick="clearFilters()"
+                        class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg transition text-sm whitespace-nowrap">
+                    Clear
+                </button>
+            </div>
+        </div>
+
+        <!-- ── Stats bar ───────────────────────────────────────────────── -->
+        <div id="stats-bar" class="mb-6 text-sm text-gray-400 hidden">
+            Showing <span id="stats-showing" class="text-white font-semibold"></span> of
+            <span id="stats-total" class="text-white font-semibold"></span> videos
+            <span id="stats-size" class="ml-3 text-gray-500"></span>
+        </div>
+
+        <div id="video-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 pb-20"></div>
     </div>
 
     <script>
-        // --- AUTH LOGIC ---
+        // ── State ──────────────────────────────────────────────────────────
+        let allVideos = [];
+
+        // ── Auth ───────────────────────────────────────────────────────────
         async function unlock() {
             const pin = document.getElementById('admin-pin').value;
             const errorEl = document.getElementById('lock-error');
-            
             try {
                 const res = await fetch('/api/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ pin })
                 });
-
                 if (res.ok) {
                     localStorage.setItem('vault_pin', pin);
                     document.getElementById('lock-screen').classList.add('hidden');
@@ -70,11 +129,10 @@
             location.reload();
         }
 
-        // --- DELETE LOGIC ---
+        // ── Delete ─────────────────────────────────────────────────────────
         async function deleteVideo(id) {
             if (!confirm("Permanently delete this video?")) return;
             const pin = localStorage.getItem('vault_pin');
-
             try {
                 const res = await fetch(`/api/videos/${id}`, {
                     method: 'DELETE',
@@ -87,7 +145,7 @@
             }
         }
 
-        // --- LAZY LOADING ---
+        // ── Lazy loading ───────────────────────────────────────────────────
         const videoObserver = new IntersectionObserver((entries) => {
             entries.forEach(entry => {
                 if (entry.isIntersecting) {
@@ -102,16 +160,131 @@
                     card.classList.add('loaded');
                 } else {
                     const video = entry.target.querySelector('video');
-                    if(video) video.pause();
+                    if (video) video.pause();
                 }
             });
         }, { threshold: 0.1 });
 
-        // --- CONTENT LOADING ---
+        // ── Helpers ────────────────────────────────────────────────────────
+        function formatSize(bytes) {
+            if (!bytes || bytes === 0) return null;
+            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+            if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+            return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+        }
+
+        function totalSizeLabel(videos) {
+            const total = videos.reduce((acc, v) => acc + (v.fileSize || 0), 0);
+            if (total === 0) return '';
+            return `· Total: ${formatSize(total)}`;
+        }
+
+        // ── Filter + sort ──────────────────────────────────────────────────
+        function getFilteredAndSorted() {
+            const dateFrom = document.getElementById('filter-date-from').value;
+            const dateTo   = document.getElementById('filter-date-to').value;
+            const sizeMin  = parseFloat(document.getElementById('filter-size-min').value) || 0;
+            const sizeMax  = parseFloat(document.getElementById('filter-size-max').value) || Infinity;
+            const sort     = document.getElementById('filter-sort').value;
+
+            let filtered = allVideos.filter(v => {
+                const date = new Date(v.processedAt);
+
+                if (dateFrom && date < new Date(dateFrom)) return false;
+                if (dateTo   && date > new Date(dateTo + 'T23:59:59')) return false;
+
+                const sizeMB = (v.fileSize || 0) / 1024 / 1024;
+                if (sizeMB < sizeMin) return false;
+                if (sizeMax !== Infinity && sizeMB > sizeMax) return false;
+
+                return true;
+            });
+
+            filtered.sort((a, b) => {
+                switch (sort) {
+                    case 'date-asc':  return new Date(a.processedAt) - new Date(b.processedAt);
+                    case 'date-desc': return new Date(b.processedAt) - new Date(a.processedAt);
+                    case 'size-asc':  return (a.fileSize || 0) - (b.fileSize || 0);
+                    case 'size-desc': return (b.fileSize || 0) - (a.fileSize || 0);
+                    default:          return 0;
+                }
+            });
+
+            return filtered;
+        }
+
+        function applyFilters() {
+            renderGrid(getFilteredAndSorted());
+        }
+
+        function clearFilters() {
+            document.getElementById('filter-date-from').value = '';
+            document.getElementById('filter-date-to').value   = '';
+            document.getElementById('filter-size-min').value  = '';
+            document.getElementById('filter-size-max').value  = '';
+            document.getElementById('filter-sort').value      = 'date-desc';
+            renderGrid(allVideos);
+        }
+
+        // ── Render ─────────────────────────────────────────────────────────
+        function renderGrid(videos) {
+            const grid = document.getElementById('video-grid');
+            const statsBar     = document.getElementById('stats-bar');
+            const statsShowing = document.getElementById('stats-showing');
+            const statsTotal   = document.getElementById('stats-total');
+            const statsSize    = document.getElementById('stats-size');
+
+            // Update stats bar
+            statsBar.classList.remove('hidden');
+            statsShowing.textContent = videos.length;
+            statsTotal.textContent   = allVideos.length;
+            statsSize.textContent    = totalSizeLabel(videos);
+
+            if (videos.length === 0) {
+                grid.innerHTML = '<div class="col-span-full text-center py-20 text-gray-500">No videos match the current filters.</div>';
+                return;
+            }
+
+            grid.innerHTML = '';
+            videos.forEach(video => {
+                const card = document.createElement('div');
+                card.className = "video-card bg-gray-800 rounded-xl overflow-hidden shadow-2xl border border-gray-700 hover:border-indigo-500 relative group";
+
+                const sizeLabel = formatSize(video.fileSize);
+                const dateLabel = new Date(video.processedAt).toLocaleDateString();
+
+                card.innerHTML = `
+                    <button onclick="deleteVideo('${video._id}')"
+                            class="absolute top-2 right-2 z-10 bg-red-600/80 hover:bg-red-600 text-white p-2 rounded-full opacity-0 group-hover:opacity-100 transition duration-200"
+                            title="Delete Video">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                    </button>
+                    <video controls class="w-full aspect-video bg-black" preload="none">
+                        <source data-src="${video.playUrl}" type="video/mp4">
+                    </video>
+                    <div class="p-4">
+                        <h3 class="font-bold text-white truncate text-sm md:text-base mb-2" title="${video.title}">${video.title || 'Untitled'}</h3>
+                        <div class="flex justify-between items-center text-[10px] uppercase tracking-wider text-gray-500">
+                            <span>${dateLabel}</span>
+                            <div class="flex items-center gap-2">
+                                ${sizeLabel ? `<span class="bg-gray-900 px-2 py-0.5 rounded border border-gray-700">${sizeLabel}</span>` : ''}
+                                <span class="bg-gray-900 px-2 py-0.5 rounded border border-gray-700">${video.type || 'MP4'}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                grid.appendChild(card);
+                videoObserver.observe(card);
+            });
+        }
+
+        // ── Load ───────────────────────────────────────────────────────────
         async function loadVideos() {
             const pin = localStorage.getItem('vault_pin');
             if (!pin) return;
-            
+
             const grid = document.getElementById('video-grid');
             grid.innerHTML = '<p class="text-gray-500 animate-pulse col-span-full text-center py-20 text-xl">Accessing encrypted records...</p>';
 
@@ -124,46 +297,23 @@
                     logout();
                     return;
                 }
-                
+
                 const data = await response.json();
+
                 if (data.length === 0) {
                     grid.innerHTML = '<div class="col-span-full text-center py-20 text-gray-500">The vault is currently empty.</div>';
                     return;
                 }
 
-                grid.innerHTML = ''; 
-                data.forEach(video => {
-                    const card = document.createElement('div');
-                    card.className = "video-card bg-gray-800 rounded-xl overflow-hidden shadow-2xl border border-gray-700 hover:border-indigo-500 relative group";
-                    
-                    card.innerHTML = `
-                        <button onclick="deleteVideo('${video._id}')" 
-                                class="absolute top-2 right-2 z-10 bg-red-600/80 hover:bg-red-600 text-white p-2 rounded-full opacity-0 group-hover:opacity-100 transition duration-200"
-                                title="Delete Video">
-                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                            </svg>
-                        </button>
-                        <video controls class="w-full aspect-video bg-black" preload="none">
-                            <source data-src="${video.playUrl}" type="video/mp4">
-                        </video>
-                        <div class="p-4">
-                            <h3 class="font-bold text-white truncate text-sm md:text-base mb-1" title="${video.title}">${video.title || 'Untitled'}</h3>
-                            <div class="flex justify-between items-center text-[10px] uppercase tracking-wider text-gray-500">
-                                <span>${new Date(video.processedAt).toLocaleDateString()}</span>
-                                <span class="bg-gray-900 px-2 py-0.5 rounded border border-gray-700">${video.type || 'MP4'}</span>
-                            </div>
-                        </div>
-                    `;
-                    grid.appendChild(card);
-                    videoObserver.observe(card);
-                });
+                allVideos = data;
+                renderGrid(getFilteredAndSorted());
 
             } catch (error) {
                 grid.innerHTML = `<div class="col-span-full text-red-400 p-6 border border-red-900 bg-red-900/10 rounded-xl">Connection Error: ${error.message}</div>`;
             }
         }
 
+        // ── Init ───────────────────────────────────────────────────────────
         window.addEventListener('DOMContentLoaded', () => {
             if (localStorage.getItem('vault_pin')) {
                 document.getElementById('lock-screen').classList.add('hidden');
