@@ -251,53 +251,25 @@ async function extractVidsonicUrl(page: any, streamId: string): Promise<string |
 // ✅ FIXED: Wait for Streamtape lazy-loading
 async function extractStreamtapeUrl(page: any, streamId: string): Promise<string | null> {
   try {
-    // CRITICAL FIX: Wait for the video element's src to be populated
-    // Streamtape lazy-loads the player, so the video element exists but src is empty initially
-    // We need to wait 2-3 seconds for JavaScript to populate the src attribute
-    log(streamId, 'Waiting for Streamtape video player to load...');
-    
-    await withTimeout(
-      page.waitForFunction(
-        () => {
-          const video = document.querySelector('video') as HTMLVideoElement | null;
-          if (!video) return false;
-          // Check if src is populated (either directly or via currentSrc)
-          const hasSrc = !!(video.src || video.currentSrc || video.getAttribute('src'));
-          return hasSrc;
-        },
-        { timeout: 8000 }
-      ),
-      5500,
-      undefined
-    ).catch(() => {});
+    const videoUrl = await page.evaluate(() => {
+      const video = document.querySelector('video');
+      if (!video) return null;
+      
+      const src = video.src || video.currentSrc || video.getAttribute('src');
+      if (src && src.length > 0 && !src.startsWith('blob:')) {
+        return src.startsWith('//') ? 'https:' + src : src;
+      }
+      return null;
+    });
 
-    return withTimeout(
-      page.evaluate(() => {
-        try {
-          // Try norobotlink first (direct download link)
-          const norobotEl = document.getElementById('norobotlink');
-          if (norobotEl) {
-            let href = norobotEl.textContent?.trim() || '';
-            if (href.startsWith('//')) return 'https:' + href;
-            if (href.startsWith('https://')) return href;
-          }
+    if (videoUrl) {
+      log(streamId, `Streamtape: ✅ Found video URL from <video> tag`);
+      return videoUrl;
+    }
 
-          // Then try video element (player link)
-          const video = document.querySelector('video') as HTMLVideoElement | null;
-          if (video) {
-            let src = video.getAttribute('src') || video.src || video.currentSrc || '';
-            if (src && src.startsWith('//')) return 'https:' + src;
-            if (src && src.startsWith('https://')) return src;
-          }
+    log(streamId, 'Streamtape: ❌ No video URL found');
+    return null;
 
-          return null;
-        } catch {
-          return null;
-        }
-      }),
-      2000,
-      null
-    );
   } catch (error: any) {
     log(streamId, `Streamtape extraction error: ${error.message}`, 'WARN');
     return null;
