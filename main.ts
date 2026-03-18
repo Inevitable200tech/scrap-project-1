@@ -57,8 +57,9 @@ async function processNextJob(): Promise<void> {
     console.error(`[QUEUE] Job ${jobId} threw unhandled error: ${err.message}`);
   }
 
-  // Process next job immediately after current one finishes
-  processNextJob();
+  // ✅ await ensures the next job only starts after the current one
+  // fully completes — including the FFmpeg encode and R2 upload
+  await processNextJob();
 }
 
 // ── Per-host cooldown ──────────────────────────────────────────────────────
