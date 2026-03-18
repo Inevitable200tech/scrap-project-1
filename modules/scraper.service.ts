@@ -1,19 +1,12 @@
 import playwrightExtra from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-// ADD — handles both CJS default.default and ESM default
-import AdblockerPluginImport from 'puppeteer-extra-plugin-adblocker';
-const AdblockerPlugin = (AdblockerPluginImport as any).default ?? AdblockerPluginImport;
+import { PlaywrightBlocker } from '@ghostery/adblocker-playwright';
+import fetch from 'cross-fetch';
+import { promises as fs } from 'fs';
 import { filterVideoUrls } from './utils.js';
 
 // ─── Plugin Registration ───────────────────────────────────────────────────────
 playwrightExtra.chromium.use(StealthPlugin());
-playwrightExtra.chromium.use(
-  AdblockerPlugin({
-    blockTrackers: true,
-    blockTrackersAndAds: true,
-    useCache: true,
-  })
-);
 
 export interface ScrapeResult {
   title: string;
@@ -23,8 +16,28 @@ export interface ScrapeResult {
   deadReason?: string;
 }
 
+// ─── Ghostery blocker singleton (shared across scrape calls) ──────────────────
+// Loaded once, cached to disk so filter lists aren't re-downloaded every run.
+let _blocker: PlaywrightBlocker | null = null;
+async function getBlocker(): Promise<PlaywrightBlocker> {
+  if (_blocker) return _blocker;
+  try {
+    _blocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
+      path: '/tmp/ghostery-engine.bin',
+      read: fs.readFile,
+      write: fs.writeFile,
+    });
+    console.log('[Ghostery] Adblocker engine loaded (uBlock Origin + EasyList filters)');
+  } catch (e: any) {
+    console.warn(`[Ghostery] Failed to load blocker, continuing without it: ${e.message}`);
+    // Fall back to a no-op so the rest of the pipeline still works
+    _blocker = null as any;
+  }
+  return _blocker!;
+}
+
 // ─── Aggressive ad/pop-up/overlay block patterns ──────────────────────────────
-// Second layer on top of the adblocker plugin — aborted at Playwright route level.
+// Layer 2: aborted at Playwright route level, on top of Ghostery.
 const BLOCKED_URL_PATTERNS: RegExp[] = [
   /doubleclick\.net/i, /googlesyndication\.com/i, /adnxs\.com/i,
   /adsystem\.com/i, /amazon-adsystem\.com/i, /outbrain\.com/i,
@@ -414,7 +427,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           '--disable-infobars',
           '--window-size=1280,900',
           '--disable-blink-features=AutomationControlled',
-          '--block-new-web-contents',   // suppress new windows/tabs at Chromium level
+          '--block-new-web-contents',
           '--disable-component-extensions-with-background-pages',
         ],
       });
@@ -428,48 +441,18 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       page = await context.newPage();
       log(streamId, 'Page opened');
 
-      // ── Layer 4: Patch window.open + ad globals BEFORE any page JS runs ───────
-      await page.addInitScript(() => {
-        // Seal window.open so pop-unders can't open new tabs/windows
-        window.open = () => null as any;
-        try {
-          Object.defineProperty(window, 'open', { value: () => null, writable: false });
-        } catch { /* already sealed or strict mode */ }
+      // ── Layer 0: Ghostery adblocker (uBlock Origin + EasyList filter lists) ──
+      try {
+        const blocker = await getBlocker();
+        if (blocker) {
+          await blocker.enableBlockingInPage(page);
+          log(streamId, 'Ghostery adblocker active on page');
+        }
+      } catch (e: any) {
+        log(streamId, `Ghostery enableBlockingInPage failed: ${e.message}`, 'WARN');
+      }
 
-        // Neutralise common ad bootstrap globals
-        (window as any).popUnder  = () => null;
-        (window as any).popunder  = () => null;
-        (window as any).showAd    = () => null;
-        (window as any).loadAd    = () => null;
-        (window as any).displayAd = () => null;
-
-        // Block runtime ad-script injection via createElement override
-        const _createElement = document.createElement.bind(document);
-        (document as any).createElement = function (tag: string, ...args: any[]) {
-          const el = _createElement(tag, ...args);
-          if (tag.toLowerCase() === 'script') {
-            const _setAttr = el.setAttribute.bind(el);
-            el.setAttribute = function (name: string, value: string) {
-              if (name === 'src') {
-                const blocked = [
-                  'popads', 'popcash', 'popunder', 'exoclick',
-                  'trafficjunky', 'adcash', 'hilltopads', 'propellerads',
-                  'plugrush', 'juicyads', 'adform', 'adnxs',
-                  'dtscout', 'dtscdn',
-                ];
-                if (blocked.some(b => value.includes(b))) {
-                  console.warn(`[AdBlock-init] Blocked script injection: ${value}`);
-                  return;
-                }
-              }
-              _setAttr(name, value);
-            };
-          }
-          return el;
-        };
-      });
-
-      // ── Layer 1: Playwright route interception (network-level block) ──────────
+      // ── Layer 1: Playwright route interception (custom blocklist) ─────────────
       await page.route('**/*', async (route: any) => {
         const reqUrl: string = route.request().url();
         if (BLOCKED_URL_PATTERNS.some(p => p.test(reqUrl))) {
@@ -507,6 +490,44 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         } catch (e: any) {
           log(streamId, `Popup handler error: ${e.message}`, 'WARN');
         }
+      });
+
+      // ── Layer 4: Patch window.open + ad globals BEFORE any page JS runs ───────
+      await page.addInitScript(() => {
+        window.open = () => null as any;
+        try {
+          Object.defineProperty(window, 'open', { value: () => null, writable: false });
+        } catch { /* already sealed */ }
+
+        (window as any).popUnder  = () => null;
+        (window as any).popunder  = () => null;
+        (window as any).showAd    = () => null;
+        (window as any).loadAd    = () => null;
+        (window as any).displayAd = () => null;
+
+        const _createElement = document.createElement.bind(document);
+        (document as any).createElement = function (tag: string, ...args: any[]) {
+          const el = _createElement(tag, ...args);
+          if (tag.toLowerCase() === 'script') {
+            const _setAttr = el.setAttribute.bind(el);
+            el.setAttribute = function (name: string, value: string) {
+              if (name === 'src') {
+                const blocked = [
+                  'popads', 'popcash', 'popunder', 'exoclick',
+                  'trafficjunky', 'adcash', 'hilltopads', 'propellerads',
+                  'plugrush', 'juicyads', 'adform', 'adnxs',
+                  'dtscout', 'dtscdn',
+                ];
+                if (blocked.some(b => value.includes(b))) {
+                  console.warn(`[AdBlock-init] Blocked script injection: ${value}`);
+                  return;
+                }
+              }
+              _setAttr(name, value);
+            };
+          }
+          return el;
+        };
       });
 
       // Navigation
