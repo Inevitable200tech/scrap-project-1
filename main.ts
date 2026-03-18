@@ -1,4 +1,4 @@
-// main.ts
+// main.ts - Updated with progress tracking
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -13,6 +13,7 @@ import {
   listJobs,
   cleanupIncompleteMultipartUploads,
   JobFailureReason,
+  Job,
 } from './modules/storage.service.js';
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -75,7 +76,7 @@ async function enforceHostCooldown(url: string): Promise<void> {
   } catch {}
 }
 
-// ── Job processor ──────────────────────────────────────────────────────────
+// ── Job processor with progress tracking ────────────────────────────────────
 async function processJob(jobId: string): Promise<void> {
   const job = await getJob(jobId);
   if (!job) return;
@@ -86,7 +87,10 @@ async function processJob(jobId: string): Promise<void> {
 
   try {
     // ── Step 1: Scrape ───────────────────────────────────────────────────
-    await updateJob(jobId, { status: 'scraping' });
+    await updateJob(jobId, { 
+      status: 'scraping',
+      progress: { stage: 'downloading', percent: 5 }
+    });
     await enforceHostCooldown(job.url);
 
     let scrapeResult: ScrapeResult;
@@ -114,6 +118,10 @@ async function processJob(jobId: string): Promise<void> {
     // No video URL found on first attempt — retry once
     if (!scrapeResult.videos?.length) {
       console.log(`[JOB:${jobId}] No videos on first attempt, retrying in 30s...`);
+      await updateJob(jobId, { 
+        progress: { stage: 'downloading', percent: 15 } 
+      });
+      
       await new Promise(r => setTimeout(r, 30_000));
 
       let retryResult: ScrapeResult;
@@ -152,11 +160,15 @@ async function processJob(jobId: string): Promise<void> {
     const videoUrl = scrapeResult.videos[0].url;
     const originalPageUrl = scrapeResult.originalUrl;
 
-    // ── Step 2: Store ────────────────────────────────────────────────────
-    await updateJob(jobId, { status: 'storing' });
+    // ── Step 2: Store with progress tracking ────────────────────────────
+    await updateJob(jobId, { 
+      status: 'storing',
+      progress: { stage: 'downloading', percent: 25 }
+    });
 
     const storageResult = await processAndStoreVideo(
       videoUrl,
+      jobId,
       job.title || scrapeResult.title,
       async () => {
         console.log(`[JOB:${jobId}] Token expired — re-scraping...`);
@@ -165,6 +177,10 @@ async function processJob(jobId: string): Promise<void> {
         const freshUrl = fresh.videos[0]?.url;
         if (!freshUrl) throw new Error('Re-scrape returned no video URLs');
         return freshUrl;
+      },
+      // Progress callback
+      async (progress) => {
+        await updateJob(jobId, { progress });
       }
     );
 
@@ -196,6 +212,7 @@ async function processJob(jobId: string): Promise<void> {
 
     await updateJob(jobId, {
       status: 'done',
+      progress: { stage: 'complete', percent: 100 },
       result: {
         title: job.title || scrapeResult.title,
         r2Key: storageResult.r2Key,
@@ -253,6 +270,7 @@ app.get('/api/scrape/status/:jobId', async (req, res): Promise<any> => {
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
       queuePosition: queuePosition >= 0 ? queuePosition + 1 : null,
+      progress: job.progress,  // NEW: Include progress
     };
 
     if (job.status === 'done') {
@@ -281,6 +299,7 @@ app.get('/api/scrape/jobs', async (req, res): Promise<any> => {
       createdAt: j.createdAt,
       updatedAt: j.updatedAt,
       error: j.error,
+      progress: j.progress,  // NEW: Include progress
     })));
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
