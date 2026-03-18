@@ -5,8 +5,6 @@ import { MongoClient, Db, ObjectId } from "mongodb";
 import crypto from "crypto";
 import { PassThrough, Readable } from "stream";
 import { spawn } from "child_process";
-import https from "https";
-import http from "http";
 import { R2_CONFIG, MONGO_URI, MONGO_DB } from "./config.js";
 
 export const s3Client = new S3Client({
@@ -110,9 +108,9 @@ async function deleteFromR2(key: string): Promise<void> {
       Bucket: R2_CONFIG.bucket,
       Key: key,
     }));
-    console.log(`[STORAGE] Deleted duplicate from R2: ${key}`);
+    console.log(`[STORAGE] Deleted from R2: ${key}`);
   } catch (err: any) {
-    console.error(`[STORAGE] Failed to delete duplicate from R2 (${key}): ${err.message}`);
+    console.error(`[STORAGE] Failed to delete from R2 (${key}): ${err.message}`);
   }
 }
 
@@ -131,64 +129,22 @@ function getUrlSecondsRemaining(videoUrl: string): number {
   }
 }
 
+/**
+ * Returns the Referer and Origin headers for a given video CDN URL.
+ * FFmpeg needs these to pass CDN access checks.
+ */
 function getSiteOrigin(videoUrl: string): { referer: string; origin: string } {
-  if (/vidsonic/i.test(videoUrl))   return { referer: 'https://vidsonic.net/',   origin: 'https://vidsonic.net' };
-  if (/vidara/i.test(videoUrl))     return { referer: 'https://vidara.so/',       origin: 'https://vidara.so' };
-  if (/vidnest/i.test(videoUrl))    return { referer: 'https://vidnest.to/',      origin: 'https://vidnest.to' };
-  if (/streamtape/i.test(videoUrl)) return { referer: 'https://streamtape.com/', origin: 'https://streamtape.com' };
+  if (/vidsonic/i.test(videoUrl))   return { referer: 'https://vidsonic.net/',        origin: 'https://vidsonic.net' };
+  if (/vidara/i.test(videoUrl))     return { referer: 'https://vidara.so/',            origin: 'https://vidara.so' };
+  if (/vidnest/i.test(videoUrl))    return { referer: 'https://vidnest.to/',           origin: 'https://vidnest.to' };
+  if (/streamtape/i.test(videoUrl)) return { referer: 'https://streamtape.com/',       origin: 'https://streamtape.com' };
+  if (/boodstream/i.test(videoUrl)) return { referer: 'https://share.boodstream.cc/', origin: 'https://share.boodstream.cc' };
   try {
     const u = new URL(videoUrl);
     return { referer: u.origin + '/', origin: u.origin };
   } catch {
     return { referer: '', origin: '' };
   }
-}
-
-function fetchVideoStream(videoUrl: string): Promise<NodeJS.ReadableStream> {
-  return new Promise((resolve, reject) => {
-    const { referer, origin } = getSiteOrigin(videoUrl);
-
-    const headers: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      'Accept': '*/*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'identity',
-      'Connection': 'keep-alive',
-      ...(referer ? { 'Referer': referer } : {}),
-      ...(origin  ? { 'Origin': origin }   : {}),
-    };
-
-    const parsedUrl = new URL(videoUrl);
-    const isHttps = parsedUrl.protocol === 'https:';
-
-    const options = {
-      hostname: parsedUrl.hostname,
-      port: parsedUrl.port || (isHttps ? 443 : 80),
-      path: parsedUrl.pathname + parsedUrl.search,
-      method: 'GET',
-      headers,
-      rejectUnauthorized: false,
-    };
-
-    const lib = isHttps ? https : http;
-    const req = lib.request(options, (res) => {
-      if (res.statusCode && res.statusCode >= 400) {
-        reject(new Error(`HTTP ${res.statusCode} fetching video stream`));
-        res.resume();
-        return;
-      }
-      if ([301, 302, 307, 308].includes(res.statusCode!)) {
-        const location = res.headers['location'];
-        if (!location) { reject(new Error('Redirect with no Location header')); return; }
-        resolve(fetchVideoStream(location));
-        return;
-      }
-      resolve(res);
-    });
-
-    req.on('error', reject);
-    req.end();
-  });
 }
 
 export async function processAndStoreVideo(
@@ -223,63 +179,47 @@ export async function processAndStoreVideo(
     const hash = crypto.createHash('sha256');
     const r2Key = `videos/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.mp4`;
 
-    console.log(`[STORAGE] ${isM3U8 ? 'HLS' : 'Direct'} detected. Shrinking to 480p: ${videoUrl.substring(0, 80)}...`);
+    // ── Build browser-like headers for FFmpeg ──────────────────────────────
+    // Passed via -headers for both HLS and direct MP4.
+    // This bypasses TLS fingerprint checks on CDNs like boodstream and vidsonic
+    // that reject non-browser http clients (including Node's built-in http).
+    const { referer, origin } = getSiteOrigin(videoUrl);
+    const headerString = [
+      'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Accept: */*',
+      'Accept-Language: en-US,en;q=0.9',
+      ...(referer ? [`Referer: ${referer}`] : []),
+      ...(origin  ? [`Origin: ${origin}`]   : []),
+    ].join('\r\n') + '\r\n';
 
-    if (isM3U8) {
-      const { referer, origin } = getSiteOrigin(videoUrl);
-      const headerString = [
-        'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept: */*',
-        'Accept-Language: en-US,en;q=0.9',
-        ...(referer ? [`Referer: ${referer}`] : []),
-        ...(origin  ? [`Origin: ${origin}`]   : []),
-      ].join('\r\n') + '\r\n';
+    console.log(`[STORAGE] ${isM3U8 ? 'HLS' : 'Direct MP4'} — FFmpeg fetching with browser headers: ${videoUrl.substring(0, 80)}...`);
 
-      ffmpegProcess = spawn('ffmpeg', [
-        '-headers', headerString,
-        '-tls_verify', '0',
-        '-i', videoUrl,
-        '-vf', 'scale=-2:480',
-        '-r', '20',
-        '-c:v', 'libx264',
-        '-crf', '32',
-        '-preset', 'ultrafast',
-        '-b:v', '500k',
-        '-maxrate', '600k',
-        '-bufsize', '1000k',
-        '-c:a', 'aac',
-        '-b:a', '64k',
-        '-ac', '1',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-f', 'mp4',
-        'pipe:1',
-      ]);
+    // ── FFmpeg — unified approach for HLS and direct MP4 ──────────────────
+    // Both pass the URL directly to FFmpeg with -headers + -tls_verify 0.
+    // The old pipe:0 approach is removed — it broke for any CDN doing TLS
+    // fingerprinting (boodstream, vidsonic) because Node's http client
+    // doesn't look like a browser at the TLS layer.
+    const ffmpegArgs = [
+      '-headers', headerString,
+      '-tls_verify', '0',
+      '-i', videoUrl,
+      '-vf', 'scale=-2:480',
+      '-r', '20',
+      '-c:v', 'libx264',
+      '-crf', '32',
+      '-preset', 'ultrafast',
+      '-b:v', '500k',
+      // HLS-only bitrate caps
+      ...(isM3U8 ? ['-maxrate', '600k', '-bufsize', '1000k'] : []),
+      '-c:a', 'aac',
+      '-b:a', '64k',
+      '-ac', '1',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      '-f', 'mp4',
+      'pipe:1',
+    ];
 
-    } else {
-      console.log(`[STORAGE] Fetching direct MP4 via Node http...`);
-      const videoStream = await fetchVideoStream(videoUrl);
-
-      ffmpegProcess = spawn('ffmpeg', [
-        '-i', 'pipe:0',
-        '-vf', 'scale=-2:480',
-        '-r', '20',
-        '-c:v', 'libx264',
-        '-crf', '32',
-        '-preset', 'ultrafast',
-        '-b:v', '500k',
-        '-c:a', 'aac',
-        '-b:a', '64k',
-        '-ac', '1',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-f', 'mp4',
-        'pipe:1',
-      ]);
-
-      videoStream.pipe(ffmpegProcess.stdin);
-      ffmpegProcess.stdin.on('error', (e: any) => {
-        if (e.code !== 'EPIPE') console.error('[FFMPEG STDIN ERROR]:', e.message);
-      });
-    }
+    ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
 
     const videoSource: Readable = ffmpegProcess.stdout;
 
@@ -289,7 +229,12 @@ export async function processAndStoreVideo(
       if (msg.includes('Error')) console.error(`[FFMPEG]: ${msg}`);
     });
 
-    videoSource.on('data', (chunk: Buffer) => hash.update(chunk));
+    // Track bytes received to detect empty output before wasting R2 storage
+    let bytesReceived = 0;
+    videoSource.on('data', (chunk: Buffer) => {
+      hash.update(chunk);
+      bytesReceived += chunk.length;
+    });
 
     const upload = new Upload({
       client: s3Client,
@@ -305,6 +250,16 @@ export async function processAndStoreVideo(
     });
 
     await upload.done();
+
+    // ── Empty output guard ─────────────────────────────────────────────────
+    // If FFmpeg produced 0 bytes the CDN rejected the request (TLS or auth).
+    // Delete the empty R2 object and return a failure so the job can retry.
+    if (bytesReceived === 0) {
+      console.error(`[STORAGE] FFmpeg produced 0 bytes — CDN likely rejected the request`);
+      await deleteFromR2(r2Key);
+      return { success: false, error: 'FFmpeg produced empty output — CDN rejected request' };
+    }
+
     const finalHash = hash.digest('hex');
 
     const database = await getDb();
