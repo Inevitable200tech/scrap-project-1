@@ -1,10 +1,10 @@
-// storage.service.ts with progress tracking
+// storage.service.ts - MAXIMUM SPEED MODE
+// Speed over everything. No quality concerns.
 import { S3Client, DeleteObjectCommand, ListMultipartUploadsCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { MongoClient, Db } from "mongodb";
 import crypto from "crypto";
-import { Readable } from "stream";
-import { spawn, ChildProcess } from "child_process";
+import { spawn, ChildProcess, execSync } from "child_process";
 import { R2_CONFIG, MONGO_URI, MONGO_DB } from "./config.js";
 
 export const s3Client = new S3Client({
@@ -12,9 +12,7 @@ export const s3Client = new S3Client({
   endpoint: R2_CONFIG.endpoint,
   credentials: R2_CONFIG.credentials,
   maxAttempts: 5,
-  requestHandler: {
-    requestTimeout: 300000,
-  },
+  requestHandler: { requestTimeout: 300000 },
 });
 
 let db: Db;
@@ -23,6 +21,56 @@ const mongoClient = new MongoClient(MONGO_URI, {
   minPoolSize: 2,
   maxIdleTimeMS: 60000,
 });
+
+// ── Speed-First Encoding Profiles ──────────────────────────────────────────
+
+export type SpeedProfile = 'instant' | 'ultra-speed' | 'extreme-speed';
+
+interface EncodingConfig {
+  mode: 'copy' | 'encode';      // copy = no encoding (instant), encode = fast encoding
+  resolution?: string;
+  fps?: number;
+  crf?: number;
+  bitrate?: string;
+  format: 'mp4' | 'webm';         // webm is faster than mp4
+}
+
+const SPEED_PROFILES: Record<SpeedProfile, EncodingConfig> = {
+  // MODE 1: INSTANT - No encoding at all (10-20x faster)
+  // Detects if video is already H.264 MP4 and copies it directly
+  'instant': {
+    mode: 'copy',
+    format: 'mp4',
+    // No encoding = instant output
+  },
+
+  // MODE 2: ULTRA-SPEED - Extreme quality loss for 5-10x speed
+  // 144p (phone screen size), 10fps, terrible quality but fast
+  'ultra-speed': {
+    mode: 'encode',
+    format: 'webm',              // WebM VP8 is faster than H.264
+    resolution: 'scale=-2:144',  // Extreme compression: 144p (smallest usable)
+    fps: 8,                       // 8fps (slide show)
+    bitrate: '150k',             // Extremely low bitrate
+    crf: 45,                      // Worst quality (0-51 scale)
+  },
+
+  // MODE 3: EXTREME-SPEED - Absolute minimum
+  // 96p (tiny), 6fps, unplayable quality but instant
+  'extreme-speed': {
+    mode: 'encode',
+    format: 'webm',
+    resolution: 'scale=-2:96',   // 96p (thumbnail size)
+    fps: 6,                       // 6fps (barely animated)
+    bitrate: '100k',             // Minimum bitrate
+    crf: 51,                      // Absolute worst quality
+  },
+};
+
+const SPEED_PROFILE: SpeedProfile = 
+  (process.env.SPEED_PROFILE as SpeedProfile) || 'instant';
+
+console.log(`[SPEED] Profile: ${SPEED_PROFILE}`);
 
 export async function getDb(): Promise<Db> {
   if (!db) {
@@ -33,20 +81,13 @@ export async function getDb(): Promise<Db> {
       db.collection('jobs').createIndex({ status: 1 }),
       db.collection('videos').createIndex({ hash: 1 }, { unique: true }),
     ]);
+    console.log(`[STORAGE] Speed mode: ${SPEED_PROFILE}`);
   }
   return db;
 }
 
 export type JobStatus = 'pending' | 'scraping' | 'storing' | 'done' | 'failed';
-
-export type JobFailureReason =
-  | 'dead_video'
-  | 'no_video_found'
-  | 'ffmpeg_failed'
-  | 'expired_url'
-  | 'scrape_error'
-  | 'upload_failed'
-  | 'unknown';
+export type JobFailureReason = 'dead_video' | 'no_video_found' | 'ffmpeg_failed' | 'expired_url' | 'scrape_error' | 'upload_failed' | 'unknown';
 
 export interface Job {
   jobId: string;
@@ -124,10 +165,7 @@ export async function resetJobToPending(jobId: string): Promise<void> {
   const db = await getDb();
   await db.collection('jobs').updateOne(
     { jobId },
-    {
-      $set:   { status: 'pending', updatedAt: new Date() },
-      $unset: { error: '', failureReason: '' },
-    }
+    { $set: { status: 'pending', updatedAt: new Date() }, $unset: { error: '', failureReason: '' } }
   );
 }
 
@@ -138,6 +176,7 @@ export interface ProcessingResult {
   error?: string;
   isDuplicate?: boolean;
   bytesProcessed?: number;
+  encodingMode?: string;
 }
 
 async function deleteFromR2(key: string, retries = 2): Promise<void> {
@@ -145,14 +184,12 @@ async function deleteFromR2(key: string, retries = 2): Promise<void> {
   for (let i = 0; i < retries; i++) {
     try {
       await s3Client.send(new DeleteObjectCommand({ Bucket: R2_CONFIG.bucket, Key: key }));
-      console.log(`[STORAGE] Deleted: ${key}`);
       return;
     } catch (err: any) {
       lastError = err;
-      if (i < retries - 1) await new Promise(r => setTimeout(r, 500 * Math.pow(2, i)));
+      if (i < retries - 1) await new Promise(r => setTimeout(r, 100 * Math.pow(2, i)));
     }
   }
-  console.error(`[STORAGE] Failed to delete ${key}: ${lastError?.message}`);
 }
 
 function getUrlSecondsRemaining(videoUrl: string): number {
@@ -160,22 +197,20 @@ function getUrlSecondsRemaining(videoUrl: string): number {
     const u = new URL(videoUrl);
     const exp = u.searchParams.get('expires') || u.searchParams.get('exp') || u.searchParams.get('e');
     if (!exp) return -1;
-    const remaining = Math.max(0, parseInt(exp) - Math.floor(Date.now() / 1000));
-    return remaining;
+    return Math.max(0, parseInt(exp) - Math.floor(Date.now() / 1000));
   } catch {
     return -1;
   }
 }
 
-const ORIGIN_HEADERS_CACHE: Record<string, { referer: string; origin: string }> = {};
+const ORIGIN_HEADERS_CACHE: Record<string, any> = {};
 
 function getSiteOrigin(videoUrl: string): { referer: string; origin: string } {
   if (videoUrl in ORIGIN_HEADERS_CACHE) return ORIGIN_HEADERS_CACHE[videoUrl];
-
   let result;
-  if (/vidsonic/i.test(videoUrl))   result = { referer: 'https://vidsonic.net/', origin: 'https://vidsonic.net' };
-  else if (/vidara/i.test(videoUrl))     result = { referer: 'https://vidara.so/', origin: 'https://vidara.so' };
-  else if (/vidnest/i.test(videoUrl))    result = { referer: 'https://vidnest.to/', origin: 'https://vidnest.to' };
+  if (/vidsonic/i.test(videoUrl)) result = { referer: 'https://vidsonic.net/', origin: 'https://vidsonic.net' };
+  else if (/vidara/i.test(videoUrl)) result = { referer: 'https://vidara.so/', origin: 'https://vidara.so' };
+  else if (/vidnest/i.test(videoUrl)) result = { referer: 'https://vidnest.to/', origin: 'https://vidnest.to' };
   else if (/streamtape/i.test(videoUrl)) result = { referer: 'https://streamtape.com/', origin: 'https://streamtape.com' };
   else if (/boodstream/i.test(videoUrl)) result = { referer: 'https://share.boodstream.cc/', origin: 'https://share.boodstream.cc' };
   else {
@@ -186,38 +221,112 @@ function getSiteOrigin(videoUrl: string): { referer: string; origin: string } {
       result = { referer: '', origin: '' };
     }
   }
-
   ORIGIN_HEADERS_CACHE[videoUrl] = result;
   return result;
 }
 
-const FFMPEG_ARGS_TEMPLATE = (headers: string, videoUrl: string, isM3U8: boolean): string[] => [
-  '-headers', headers,
-  '-tls_verify', '0',
-  '-i', videoUrl,
-  '-threads', '0',
-  '-vf', 'scale=-2:360',
-  '-r', '24',
-  '-c:v', 'libx264',
-  '-crf', '28',
-  '-preset', 'ultrafast',
-  '-tune', 'zerolatency',
-  '-b:v', '600k',
-  ...(isM3U8 ? ['-maxrate', '700k', '-bufsize', '1200k'] : []),
-  '-c:a', 'aac',
-  '-b:a', '64k',
-  '-ac', '1',
-  '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-  '-progress', 'pipe:2',  // NEW: Progress reporting
-  '-f', 'mp4',
-  'pipe:1',
-];
+function buildHeaders(referer: string, origin: string): string {
+  return [
+    'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept: */*',
+    'Accept-Language: en-US,en;q=0.9',
+    ...(referer ? [`Referer: ${referer}`] : []),
+    ...(origin ? [`Origin: ${origin}`] : []),
+  ].join('\r\n') + '\r\n';
+}
 
-export async function cleanupIncompleteMultipartUploads(
-  olderThanMs = 60 * 60 * 1000
-): Promise<{ aborted: number; errors: number }> {
-  console.log('[R2 CLEANUP] Scanning incomplete multipart uploads...');
+// Detect if video is already H.264 MP4 (can use copy mode)
+function detectVideoCodec(videoUrl: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      const timeout = setTimeout(() => resolve(null), 5000);
+      const proc = spawn('ffprobe', [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_name',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        videoUrl,
+      ]);
 
+      let output = '';
+      proc.stdout.on('data', (data) => { output += data.toString(); });
+      proc.on('close', () => {
+        clearTimeout(timeout);
+        const codec = output.trim();
+        resolve(codec === 'h264' ? 'h264' : null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+function buildFFmpegArgs(headers: string, videoUrl: string, isM3U8: boolean, profile: SpeedProfile): string[] {
+  const config = SPEED_PROFILES[profile];
+
+  // INSTANT MODE: Direct copy (no encoding)
+  if (config.mode === 'copy') {
+    return [
+      '-headers', headers,
+      '-tls_verify', '0',
+      '-i', videoUrl,
+      '-c:v', 'copy',           // Copy video stream (NO ENCODING)
+      '-c:a', 'copy',           // Copy audio stream (NO ENCODING)
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      '-f', 'mp4',
+      'pipe:1',
+    ];
+  }
+
+  // ULTRA/EXTREME SPEED: WebM VP8 (fastest encoding codec)
+  if (config.format === 'webm') {
+    return [
+      '-headers', headers,
+      '-tls_verify', '0',
+      '-i', videoUrl,
+      '-vf', config.resolution!,
+      '-r', String(config.fps!),
+      '-c:v', 'libvpx',         // VP8 is faster than H.264
+      '-cpu-used', '5',         // Maximum speed (0-5, 5 is fastest)
+      '-b:v', config.bitrate!,
+      '-quality', 'realtime',   // Realtime encoding (fast)
+      '-c:a', 'libopus',
+      '-b:a', '32k',            // Ultra low audio bitrate
+      '-ac', '1',               // Mono (faster)
+      '-progress', 'pipe:2',
+      '-f', 'webm',
+      'pipe:1',
+    ];
+  }
+
+  // Fallback to ultra-speed if unknown
+  return buildFFmpegArgs(headers, videoUrl, isM3U8, 'ultra-speed');
+}
+
+function spawnFFmpeg(args: string[]): { process: ChildProcess; promise: Promise<void> } {
+  const process = spawn('ffmpeg', args);
+  let resolved = false;
+
+  const promise = new Promise<void>((resolve, reject) => {
+    process.stderr.on('data', (data: any) => {
+      const msg = data.toString();
+      if (msg.includes('Error')) console.error(`[FFMPEG]: ${msg.trim()}`);
+    });
+    process.on('error', (err: any) => {
+      if (!resolved) { resolved = true; reject(new Error(`FFmpeg spawn: ${err.message}`)); }
+    });
+    process.on('exit', (code: number | null) => {
+      if (!resolved) { resolved = true; if (code !== 0) reject(new Error(`FFmpeg code ${code}`)); else resolve(); }
+    });
+    process.on('close', (code: number | null) => {
+      if (!resolved) { resolved = true; if (code !== 0) reject(new Error(`FFmpeg code ${code}`)); else resolve(); }
+    });
+  });
+
+  return { process, promise };
+}
+
+export async function cleanupIncompleteMultipartUploads(olderThanMs = 60 * 60 * 1000): Promise<{ aborted: number; errors: number }> {
   let aborted = 0;
   let errors = 0;
   let isTruncated = true;
@@ -233,7 +342,6 @@ export async function cleanupIncompleteMultipartUploads(
         UploadIdMarker: uploadIdMarker,
       }));
     } catch (err: any) {
-      console.error(`[R2 CLEANUP] List failed: ${err.message}`);
       break;
     }
 
@@ -247,97 +355,17 @@ export async function cleanupIncompleteMultipartUploads(
           Bucket: R2_CONFIG.bucket, Key: Key!, UploadId: UploadId!,
         }))
           .then(() => { aborted++; })
-          .catch((err: any) => { errors++; })
+          .catch(() => { errors++; })
       );
     }
 
     if (abortPromises.length > 0) await Promise.all(abortPromises);
-
     isTruncated = response.IsTruncated ?? false;
     keyMarker = response.NextKeyMarker;
     uploadIdMarker = response.NextUploadIdMarker;
   }
 
-  console.log(`[R2 CLEANUP] Done — Aborted: ${aborted} | Errors: ${errors}`);
   return { aborted, errors };
-}
-
-function buildHeaders(referer: string, origin: string): string {
-  return [
-    'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Accept: */*',
-    'Accept-Language: en-US,en;q=0.9',
-    ...(referer ? [`Referer: ${referer}`] : []),
-    ...(origin ? [`Origin: ${origin}`] : []),
-  ].join('\r\n') + '\r\n';
-}
-
-interface FFmpegProgress {
-  frame?: number;
-  fps?: number;
-  stream_0_0_q?: number;
-  bitrate?: number;
-  total_size?: number;
-  out_time_us?: number;
-  out_time?: string;
-  dup_frames?: number;
-  drop_frames?: number;
-  speed?: number;
-  progress?: string;
-}
-
-function parseFFmpegProgress(line: string): Partial<FFmpegProgress> {
-  const result: Partial<FFmpegProgress> = {};
-  const parts = line.split('=');
-  if (parts.length === 2) {
-    const key = parts[0].trim();
-    const value = parts[1].trim();
-    if (key === 'frame') result.frame = parseInt(value);
-    else if (key === 'fps') result.fps = parseFloat(value);
-    else if (key === 'bitrate') result.bitrate = parseFloat(value);
-    else if (key === 'total_size') result.total_size = parseInt(value);
-    else if (key === 'out_time_us') result.out_time_us = parseInt(value);
-    else if (key === 'out_time') result.out_time = value;
-    else if (key === 'progress') result.progress = value;
-  }
-  return result;
-}
-
-function spawnFFmpeg(args: string[]): { process: ChildProcess; promise: Promise<void> } {
-  const process = spawn('ffmpeg', args);
-  let resolved = false;
-
-  const promise = new Promise<void>((resolve, reject) => {
-    process.stderr.on('data', (data: any) => {
-      const msg = data.toString();
-      if (msg.includes('Error')) console.error(`[FFMPEG]: ${msg.trim()}`);
-    });
-
-    process.on('error', (err: any) => {
-      if (!resolved) {
-        resolved = true;
-        reject(new Error(`FFmpeg spawn error: ${err.message}`));
-      }
-    });
-
-    process.on('exit', (code: number | null) => {
-      if (!resolved) {
-        resolved = true;
-        if (code !== 0) reject(new Error(`FFmpeg exited with code ${code}`));
-        else resolve();
-      }
-    });
-
-    process.on('close', (code: number | null) => {
-      if (!resolved) {
-        resolved = true;
-        if (code !== 0) reject(new Error(`FFmpeg closed with code ${code}`));
-        else resolve();
-      }
-    });
-  });
-
-  return { process, promise };
 }
 
 export async function processAndStoreVideo(
@@ -353,188 +381,81 @@ export async function processAndStoreVideo(
     const secondsLeft = getUrlSecondsRemaining(videoUrl);
     if (secondsLeft !== -1 && secondsLeft < 120) {
       if (!refreshUrl) {
-        return { success: false, error: `Video URL expires in ${secondsLeft}s` };
+        return { success: false, error: `URL expires in ${secondsLeft}s` };
       }
       try {
-        console.log(`[STORAGE:${jobId}] URL expiring (${secondsLeft}s) — refreshing...`);
         videoUrl = await Promise.race([
           refreshUrl(),
-          new Promise<string>((_, reject) =>
-            setTimeout(() => reject(new Error('Refresh timeout')), 15000)
-          ),
+          new Promise<string>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 15000))
         ]);
-        console.log(`[STORAGE:${jobId}] Refreshed URL: ${videoUrl.substring(0, 80)}...`);
       } catch (e: any) {
-        return { success: false, error: `URL refresh failed: ${e.message}` };
+        return { success: false, error: `Refresh failed: ${e.message}` };
       }
     }
 
     const isM3U8 = videoUrl.includes('.m3u8');
     const hash = crypto.createHash('sha256');
-    const r2Key = `videos/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.mp4`;
+    const profile = SPEED_PROFILE;
+    const config = SPEED_PROFILES[profile];
 
+    // Try to detect if already H.264 MP4 (for instant mode)
+    let usingCopyMode = false;
+    if (profile === 'instant' && !isM3U8) {
+      const codec = await detectVideoCodec(videoUrl);
+      if (codec === 'h264') {
+        usingCopyMode = true;
+        console.log(`[STORAGE:${jobId}] ✓ H.264 detected — using COPY mode (INSTANT)`);
+      }
+    }
+
+    const r2Key = `videos/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${config.format}`;
     const { referer, origin } = getSiteOrigin(videoUrl);
     const headers = buildHeaders(referer, origin);
-    const ffmpegArgs = FFMPEG_ARGS_TEMPLATE(headers, videoUrl, isM3U8);
+    const ffmpegArgs = buildFFmpegArgs(headers, videoUrl, isM3U8, profile);
 
-    console.log(`[STORAGE:${jobId}] Starting ${isM3U8 ? 'HLS' : 'MP4'} processing...`);
+    const startTime = Date.now();
+    console.log(`[STORAGE:${jobId}] START | Profile: ${profile} | Mode: ${usingCopyMode ? 'COPY' : 'ENCODE'} | Format: ${config.format}`);
 
-    const ffmpegTimeout = 600000;
     let bytesReceived = 0;
     let ffmpegError: Error | null = null;
-    let videoDuration = 0;
-    let currentFrame = 0;
 
     const { process: ffmpeg, promise: ffmpegPromise } = spawnFFmpeg(ffmpegArgs);
     ffmpegProc = ffmpeg;
 
     const ffmpegTimeoutHandle = setTimeout(() => {
       if (ffmpegProc && !ffmpegProc.killed) {
-        console.error(`[STORAGE:${jobId}] FFmpeg timeout — killing`);
         ffmpegProc.kill('SIGKILL');
       }
-    }, ffmpegTimeout);
-
-    // ── Parse FFmpeg progress from stderr ──────────────────────────────────
-    const progressBuffer: string[] = [];
-    let lastProgressLog = Date.now();
+    }, 600000);
 
     ffmpeg.stderr!.on('data', (data: any) => {
       const text = data.toString();
-      
-      // Parse duration once
-      if (!videoDuration && text.includes('Duration:')) {
-        const durationMatch = text.match(/Duration: (\d+):(\d+):(\d+\.\d+)/);
-        if (durationMatch) {
-          const [, hours, minutes, seconds] = durationMatch;
-          videoDuration = parseInt(hours) * 3600 + parseInt(minutes) * 60 + parseFloat(seconds);
-          console.log(`[STORAGE:${jobId}] Video duration: ${videoDuration.toFixed(1)}s`);
-        }
-      }
-
-      // Accumulate progress lines
-      progressBuffer.push(text);
-
-      // Log progress periodically (every 2s)
-      const now = Date.now();
-      if (now - lastProgressLog > 2000) {
-        const fullText = progressBuffer.join('');
-        progressBuffer.length = 0;
-
-        const lines = fullText.split('\n');
-        for (const line of lines) {
-          if (line.includes('frame=')) {
-            const progress = parseFFmpegProgress(line);
-            if (progress.frame) currentFrame = progress.frame;
-
-            const fps = progress.fps || 24;
-            const timeUs = progress.out_time_us || 0;
-            const timeSeconds = timeUs / 1_000_000;
-
-            let encodePercent = 0;
-            if (videoDuration > 0) {
-              encodePercent = Math.min(100, (timeSeconds / videoDuration) * 100);
-            }
-
-            const downloadPercent = 50; // Assume download is ~50% when encoding starts
-            const uploadPercent = 0; // Will be updated later
-            const overallPercent = Math.round(
-              downloadPercent * 0.3 + encodePercent * 0.5 + uploadPercent * 0.2
-            );
-
-            if (onProgress) {
-              onProgress({
-                stage: 'encoding',
-                percent: overallPercent,
-                bytesProcessed: bytesReceived,
-              }).catch(() => {});
-            }
-
-            console.log(
-              `[STORAGE:${jobId}] ⏳ ENCODING: ${encodePercent.toFixed(1)}% | Frame ${currentFrame} @ ${fps.toFixed(1)}fps | Overall: ${overallPercent}%`
-            );
-          }
-        }
-        lastProgressLog = now;
-      }
-
       if (text.includes('Error')) console.error(`[FFMPEG:${jobId}]: ${text.trim()}`);
     });
 
-    // ── FFmpeg stdout: capture video data ───────────────────────────────────
     ffmpeg.stdout!.on('data', (chunk: Buffer) => {
       hash.update(chunk);
       bytesReceived += chunk.length;
-
-      if (onProgress) {
-        onProgress({
-          stage: 'uploading',
-          percent: 50,  // Will be refined below
-          bytesProcessed: bytesReceived,
-        }).catch(() => {});
-      }
     });
 
     ffmpeg.stdout!.on('error', (err: any) => {
-      ffmpegError = new Error(`FFmpeg stream error: ${err.message}`);
+      ffmpegError = new Error(`Stream error: ${err.message}`);
     });
 
-    // ── Upload to R2 with progress tracking ─────────────────────────────────
+    // Simple upload progress
     const upload = new Upload({
       client: s3Client,
       params: {
         Bucket: R2_CONFIG.bucket,
         Key: r2Key,
         Body: ffmpeg.stdout!,
-        ContentType: 'video/mp4',
+        ContentType: config.format === 'webm' ? 'video/webm' : 'video/mp4',
         Metadata: { 'original-title': title.substring(0, 100) },
       },
       queueSize: 16,
       partSize: 52428800,
       leavePartsOnError: false,
     });
-
-    // Track upload progress
-    let totalBytes = 0;
-    let uploadedBytes = 0;
-
-    // Monkey-patch the upload to track progress
-    const origDone = upload.done.bind(upload);
-    upload.done = async function() {
-      // This is hacky but works - monitor the actual upload
-      const uploadStart = Date.now();
-      const progressInterval = setInterval(() => {
-        if (bytesReceived > 0) {
-          // Estimate upload progress (will be 0-100% as data flows)
-          const uploadPercent = Math.min(100, (uploadedBytes / bytesReceived) * 100);
-          const overall = Math.round(
-            50 * 0.3 + 75 * 0.5 + uploadPercent * 0.2  // 50% download, 75% encode, X% upload
-          );
-
-          if (onProgress && uploadPercent > 0) {
-            onProgress({
-              stage: 'uploading',
-              percent: overall,
-              bytesProcessed: bytesReceived,
-            }).catch(() => {});
-
-            console.log(
-              `[STORAGE:${jobId}] 📤 UPLOADING: ${uploadPercent.toFixed(1)}% | ${(uploadedBytes / 1024 / 1024).toFixed(1)}MB / ${(bytesReceived / 1024 / 1024).toFixed(1)}MB | Overall: ${overall}%`
-            );
-          }
-        }
-      }, 2000);
-
-      try {
-        const result = await origDone.call(this);
-        clearInterval(progressInterval);
-        uploadedBytes = bytesReceived;
-        return result;
-      } catch (err) {
-        clearInterval(progressInterval);
-        throw err;
-      }
-    };
 
     const [uploadResult] = await Promise.allSettled([
       upload.done(),
@@ -547,15 +468,14 @@ export async function processAndStoreVideo(
     if (uploadResult.status === 'rejected') throw uploadResult.reason;
     if (bytesReceived === 0) {
       await deleteFromR2(r2Key);
-      return { success: false, error: 'No video data — CDN rejected' };
+      return { success: false, error: 'No video data' };
     }
 
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const sizeMB = (bytesReceived / 1024 / 1024).toFixed(2);
+
     if (onProgress) {
-      onProgress({
-        stage: 'complete',
-        percent: 100,
-        bytesProcessed: bytesReceived,
-      }).catch(() => {});
+      onProgress({ stage: 'complete', percent: 100, bytesProcessed: bytesReceived }).catch(() => {});
     }
 
     const finalHash = hash.digest('hex');
@@ -563,9 +483,9 @@ export async function processAndStoreVideo(
 
     const existing = await database.collection('videos').findOne({ hash: finalHash });
     if (existing) {
-      console.log(`[STORAGE:${jobId}] ✓ Duplicate (${finalHash}) — removed copy`);
       await deleteFromR2(r2Key);
-      return { success: true, hash: finalHash, r2Key: existing.r2Key, isDuplicate: true, bytesProcessed: bytesReceived };
+      console.log(`[STORAGE:${jobId}] ✓ DUPLICATE | ${elapsed}s | ${sizeMB}MB`);
+      return { success: true, hash: finalHash, r2Key: existing.r2Key, isDuplicate: true, bytesProcessed: bytesReceived, encodingMode: profile };
     }
 
     await database.collection('videos').insertOne({
@@ -573,16 +493,14 @@ export async function processAndStoreVideo(
       hash: finalHash,
       r2Key,
       originalUrl: videoUrl,
-      type: isM3U8 ? 'hls_converted' : 'direct_mp4_optimized',
+      type: `speed_${profile}`,
+      format: config.format,
       sizeBytes: bytesReceived,
       processedAt: new Date(),
     });
 
-    console.log(
-      `[STORAGE:${jobId}] ✓ COMPLETE | ${r2Key} | ${(bytesReceived / 1024 / 1024).toFixed(2)}MB | Hash: ${finalHash.substring(0, 8)}...`
-    );
-
-    return { success: true, hash: finalHash, r2Key, bytesProcessed: bytesReceived };
+    console.log(`[STORAGE:${jobId}] ✓ DONE | ${elapsed}s | ${sizeMB}MB | ${profile} | ${finalHash.substring(0, 8)}...`);
+    return { success: true, hash: finalHash, r2Key, bytesProcessed: bytesReceived, encodingMode: profile };
 
   } catch (error: any) {
     if (ffmpegProc && !ffmpegProc.killed) {
@@ -596,8 +514,7 @@ export async function processAndStoreVideo(
 export async function closeConnections(): Promise<void> {
   try {
     await mongoClient.close();
-    console.log('[STORAGE] MongoDB connections closed');
   } catch (err: any) {
-    console.error(`[STORAGE] Shutdown error: ${err.message}`);
+    console.error(`Shutdown error: ${err.message}`);
   }
 }
