@@ -6,6 +6,7 @@ playwrightExtra.chromium.use(StealthPlugin());
 
 export interface ScrapeResult {
   title: string;
+  originalUrl: string; // the page URL — used to re-scrape a fresh video token
   videos: { site: string; url: string }[];
 }
 
@@ -368,7 +369,9 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       log(streamId, `Final result: ${filteredVideos.length} valid video URLs after filtering`);
       log(streamId, 'Scrape completed successfully');
 
-      return { title, videos: filteredVideos };
+      // originalUrl is the page URL passed in — used by storage service to
+      // re-scrape a fresh video token if the current one expires before FFmpeg starts.
+      return { title, originalUrl: url, videos: filteredVideos };
 
     } catch (error: any) {
       log(streamId, `SCRAPE FAILED: ${error.message || 'Unknown error'}`, 'ERROR');
