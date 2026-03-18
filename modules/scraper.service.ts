@@ -6,8 +6,9 @@ playwrightExtra.chromium.use(StealthPlugin());
 
 export interface ScrapeResult {
   title: string;
-  originalUrl: string; // the page URL — used to re-scrape a fresh video token
+  originalUrl: string;
   videos: { site: string; url: string }[];
+  dead?: boolean;
 }
 
 function log(streamId: string, message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO') {
@@ -24,28 +25,136 @@ function isPageAlive(p: any): boolean {
   }
 }
 
+// ── Universal dead video detector ──────────────────────────────────────────
+const DEAD_VIDEO_SIGNALS = [
+  /video (has been|was) (removed|deleted)/i,
+  /removed by the uploader/i,
+  /this video is (no longer|not) available/i,
+  /video (not found|unavailable|expired)/i,
+  /file (not found|has been deleted|no longer exists)/i,
+  /content (has been|was) (removed|deleted|taken down)/i,
+  /page not found/i,
+  /404 not found/i,
+  /maybe it got deleted by the creator/i,
+  /video-empty/i,
+  /img_loading_error/i,
+  /this file (no longer exists|has been removed)/i,
+  /file (was|has been) (deleted|removed)/i,
+  /This video has been removed due to term violence./i,
+];
+
+function detectDeadVideo(httpStatus: number, html: string): string | null {
+  if (httpStatus === 404 || httpStatus === 410) return `HTTP ${httpStatus}`;
+
+  const bodyOnly = html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '');
+
+  for (const pattern of DEAD_VIDEO_SIGNALS) {
+    if (pattern.test(bodyOnly)) return pattern.source;
+  }
+  return null;
+}
+
 /**
- * Vidara loads its player inside a cross-origin iframe at vidara.so/e/<filecode>.
- * We can't read that iframe from the parent page, so we rewrite the URL to
- * navigate directly to the embed page where JW Player is accessible.
- *
- * Input:  https://vidara.to/v/BYs7T9uu9UdFP/some-title
- * Output: https://vidara.so/e/BYs7T9uu9UdFP
+ * Dumps visible page text and any clues about why no video was found.
+ * Only called when 0 video URLs are collected — purely for debugging.
  */
+async function dumpPageDebugInfo(
+  page: any,
+  streamId: string,
+  interceptedCount: number
+): Promise<void> {
+  if (!isPageAlive(page)) {
+    log(streamId, '[DEBUG] Page not alive — cannot dump debug info', 'WARN');
+    return;
+  }
+
+  try {
+    const debugInfo = await page.evaluate(() => {
+      // Visible text — strip scripts/styles then get innerText
+      const clone = document.body.cloneNode(true) as HTMLElement;
+      clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
+      const visibleText = (clone.innerText || clone.textContent || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .substring(0, 1000);
+
+      // All links on the page
+      const allLinks = Array.from(document.querySelectorAll('a[href]'))
+        .map(a => (a as HTMLAnchorElement).href)
+        .filter(h => h.startsWith('http'))
+        .slice(0, 20);
+
+      // iframes
+      const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
+        src: f.src || f.getAttribute('src'),
+        id: f.id,
+      }));
+
+      // Video elements
+      const videos = Array.from(document.querySelectorAll('video')).map(v => ({
+        src: v.src,
+        currentSrc: v.currentSrc,
+        srcAttribute: v.getAttribute('src'),
+        readyState: v.readyState,
+      }));
+
+      // Common error/message containers
+      const errorSelectors = [
+        '.error', '.message', '.alert', '.notice',
+        '[class*="error"]', '[class*="empty"]', '[class*="not-found"]',
+        '[class*="unavailable"]', '[class*="deleted"]', '[class*="removed"]',
+        'h1', 'h2', '.title',
+      ];
+      const errorTexts: Record<string, string> = {};
+      for (const sel of errorSelectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          const text = el.textContent?.trim().substring(0, 100);
+          if (text) errorTexts[sel] = text;
+        }
+      }
+
+      return { visibleText, allLinks, iframes, videos, errorTexts };
+    });
+
+    log(streamId, `[DEBUG] ── No video found — page dump ──`, 'WARN');
+    log(streamId, `[DEBUG] Intercepted network requests: ${interceptedCount}`, 'WARN');
+    log(streamId, `[DEBUG] Page title: ${await page.title().catch(() => '?')}`, 'WARN');
+    log(streamId, `[DEBUG] Visible text (first 1000 chars):\n${debugInfo.visibleText}`, 'WARN');
+
+    if (debugInfo.videos.length > 0) {
+      log(streamId, `[DEBUG] Video elements found: ${JSON.stringify(debugInfo.videos, null, 2)}`, 'WARN');
+    } else {
+      log(streamId, `[DEBUG] No <video> elements on page`, 'WARN');
+    }
+
+    if (debugInfo.iframes.length > 0) {
+      log(streamId, `[DEBUG] iframes: ${JSON.stringify(debugInfo.iframes)}`, 'WARN');
+    }
+
+    if (Object.keys(debugInfo.errorTexts).length > 0) {
+      log(streamId, `[DEBUG] Error/message elements: ${JSON.stringify(debugInfo.errorTexts, null, 2)}`, 'WARN');
+    }
+
+    if (debugInfo.allLinks.length > 0) {
+      log(streamId, `[DEBUG] All links on page:\n${debugInfo.allLinks.join('\n')}`, 'WARN');
+    }
+
+  } catch (e: any) {
+    log(streamId, `[DEBUG] Failed to dump page info: ${e.message}`, 'WARN');
+  }
+}
+
 function resolveVidaraEmbedUrl(url: string): string {
   try {
     const parsed = new URL(url);
-
-    // Already an embed URL — use as-is
     if (parsed.hostname.includes('vidara.so') && parsed.pathname.startsWith('/e/')) {
       return url;
     }
-
-    // Extract filecode from path — first non-empty segment after skipping 'v'
-    // e.g. /v/BYs7T9uu9UdFP/some-title → BYs7T9uu9UdFP
     const segments = parsed.pathname.split('/').filter(Boolean);
     const filecode = segments[0] === 'v' ? segments[1] : segments[0];
-
     return `https://vidara.so/e/${filecode}`;
   } catch {
     return url;
@@ -58,7 +167,6 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
   const isVidnest    = /vidnest\./i.test(url);
   const isStreamtape = /streamtape\./i.test(url);
 
-  // Vidara: navigate directly to the embed page instead of the main page
   const targetUrl = isVidara ? resolveVidaraEmbedUrl(url) : url;
 
   log(streamId, `Starting scrape for URL: ${url}`);
@@ -71,7 +179,6 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
     let page: any = null;
 
     try {
-      // ── Browser launch ─────────────────────────────────────────────────────
       log(streamId, 'Launching browser...');
       browser = await playwrightExtra.chromium.launch({
         headless: true,
@@ -87,7 +194,6 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
       log(streamId, 'Browser launched successfully');
 
-      // ── Browser context ────────────────────────────────────────────────────
       log(streamId, 'Creating new browser context...');
       context = await browser.newContext({
         viewport: { width: 1280, height: 900 },
@@ -96,9 +202,6 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
       log(streamId, 'Browser context created');
 
-      // ── Primary page ───────────────────────────────────────────────────────
-      // Open BEFORE registering context.on('page') so the handler never sees
-      // our own tab and accidentally closes it.
       log(streamId, 'Opening primary page...');
       page = await context.newPage();
       log(streamId, 'Primary page opened');
@@ -110,17 +213,12 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       });
 
-      // ── Popup handler ──────────────────────────────────────────────────────
-      // Registered AFTER primary page so it never matches our own tab.
       context.on('page', async (popup: any) => {
         if (popup === page) return;
-
         const popupUrl = popup.url?.() || '(unknown)';
         log(streamId, `New page/popup detected → ${popupUrl}`);
-
         try {
           await new Promise(resolve => setTimeout(resolve, 800));
-
           if (!popup.isClosed()) {
             log(streamId, 'Closing popup');
             await popup.close({ runBeforeUnload: false }).catch((e: any) =>
@@ -134,14 +232,11 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }
       });
 
-      // ── Network interception ───────────────────────────────────────────────
       const interceptedVideos: { site: string; url: string }[] = [];
 
       log(streamId, 'Attaching network request interceptor...');
       page.on('request', (request: { url: () => string }) => {
         const reqUrl = request.url();
-
-        // Extended blacklist — ad trackers, analytics, CDN ad networks
         const isBlacklisted = /yandex|mc\.ru|analytics|pixel|google|\.ts($|\?)|dtscout|dtscdn|doubleclick|adnxs|adsystem|googlesyndication|amazon-adsystem|outbrain|taboola|adsbygoogle/i.test(reqUrl);
 
         if (
@@ -156,48 +251,54 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       });
 
       // ── Navigation ─────────────────────────────────────────────────────────
-      // Use targetUrl — embed URL for Vidara, original URL for everything else
+      let httpStatus = 200;
       log(streamId, `Navigating to: ${targetUrl}`);
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e: any) => {
-        log(streamId, `Navigation error (non-fatal): ${e.message}`, 'WARN');
-      });
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
+        .then((response: any) => {
+          httpStatus = response?.status() ?? 200;
+          log(streamId, `Navigation response: HTTP ${httpStatus}`);
+        })
+        .catch((e: any) => {
+          log(streamId, `Navigation error (non-fatal): ${e.message}`, 'WARN');
+        });
 
       if (!isPageAlive(page)) {
         throw new Error('Primary page was closed unexpectedly after navigation');
       }
 
-      // Streamtape and Vidara have their data available immediately after load —
-      // skip the 3.5s warm-up wait for both.
       if (!isStreamtape && !isVidara) {
         await page.waitForTimeout(3500).catch(() => {});
       }
       log(streamId, 'Navigation phase completed');
 
+      // ── Universal dead video check ─────────────────────────────────────────
+      const pageHtml = isPageAlive(page)
+        ? await page.content().catch(() => '')
+        : '';
+
+      const deadReason = detectDeadVideo(httpStatus, pageHtml);
+      if (deadReason) {
+        log(streamId, `Dead video detected (matched: ${deadReason}) — aborting`, 'WARN');
+        await context?.close().catch(() => {});
+        await browser?.close().catch(() => {});
+        return { title: 'Dead Video', originalUrl: url, videos: [], dead: true };
+      }
+
       // ── Player-specific extraction ─────────────────────────────────────────
       if (isVidara) {
         log(streamId, 'Vidara detected → JW Player extraction from embed page');
-
-        // The embed page fetches /api/stream?filecode=... immediately on load and
-        // passes the result to JW Player. A short wait is enough for that fetch
-        // to complete and the playlist to be populated.
         await page.waitForTimeout(3000).catch(() => {});
 
         const vidaraUrl = await page.evaluate(() => {
           try {
             const p = (window as any).jwplayer?.();
             if (!p) return null;
-
-            // Primary: playlist file (HLS m3u8 or direct mp4)
             const file = p.getPlaylist?.()?.[0]?.file;
             if (file && !file.startsWith('blob:')) return file;
-
-            // Fallback: first non-blob source in sources array
             const sources: any[] = p.getPlaylist?.()?.[0]?.sources ?? [];
             const valid = sources.find((s: any) => s.file && !s.file.startsWith('blob:'));
             return valid?.file ?? null;
-          } catch {
-            return null;
-          }
+          } catch { return null; }
         }).catch(() => null);
 
         if (vidaraUrl) {
@@ -210,20 +311,16 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       } else if (isVidnest) {
         log(streamId, 'Vidnest detected → JW Player path');
         const playSelector = '.jw-video, .jw-display-icon-container, video';
-        log(streamId, `Attempting click: ${playSelector}`);
         await page.click(playSelector, { force: true, timeout: 10000 }).catch((e: any) =>
           log(streamId, `Play click failed: ${e.message}`, 'WARN')
         );
         await page.waitForTimeout(2200).catch(() => {});
 
-        log(streamId, 'Extracting JW Player source...');
         const jwSource = await page.evaluate(() => {
           try {
             const player = (window as any).jwplayer?.();
             return player?.getPlaylist?.()?.[0]?.file ?? null;
-          } catch {
-            return null;
-          }
+          } catch { return null; }
         }).catch(() => null);
 
         if (jwSource) {
@@ -240,13 +337,11 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         }).catch(() => {});
 
         const playSelector = '.vjs-big-play-button, .vjs-play-control';
-        log(streamId, `Attempting click: ${playSelector}`);
         await page.click(playSelector, { force: true, timeout: 10000 }).catch((e: any) =>
           log(streamId, `Video.js click failed: ${e.message}`, 'WARN')
         );
         await page.waitForTimeout(2200).catch(() => {});
 
-        log(streamId, 'Extracting Video.js source...');
         const vjsSource = await page.evaluate(() => {
           try {
             const playerEl = document.querySelector('.video-js');
@@ -257,9 +352,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
               return firstPlayer ? (firstPlayer as any).src() : null;
             }
             return null;
-          } catch {
-            return null;
-          }
+          } catch { return null; }
         }).catch(() => null);
 
         if (vjsSource && !String(vjsSource).startsWith('blob:')) {
@@ -272,31 +365,22 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       } else if (isStreamtape) {
         log(streamId, 'Streamtape detected → norobotlink / video src extraction');
 
-        // The URL is embedded in the initial HTML — no click or extra wait needed.
-        // #norobotlink is a <div> whose textContent is set by an inline <script>
-        // immediately on page load. The <video> src attribute is also in the HTML.
         const streamtapeUrl = await page.evaluate(() => {
           try {
-            // Method 1: #norobotlink — most reliable, always present after load
             const norobotEl = document.getElementById('norobotlink');
             if (norobotEl) {
               let href = norobotEl.textContent?.trim() || '';
               if (href.startsWith('//')) return 'https:' + href;
               if (href.startsWith('https://')) return href;
             }
-
-            // Method 2: raw src attribute on <video> (already in HTML, no play needed)
             const video = document.querySelector('video');
             if (video) {
               let src = video.getAttribute('src') || '';
               if (src.startsWith('//')) return 'https:' + src;
               if (src.startsWith('https://')) return src;
             }
-
             return null;
-          } catch {
-            return null;
-          }
+          } catch { return null; }
         }).catch(() => null);
 
         if (streamtapeUrl) {
@@ -326,8 +410,6 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       }
 
       // ── DOM <video> fallback ───────────────────────────────────────────────
-      // Skip for Streamtape and Vidara — both already handled above.
-      // Vidara's <video> only ever has a blob: src which is useless.
       if (!isStreamtape && !isVidara) {
         log(streamId, 'Checking <video> element source...');
         const domMedia = isPageAlive(page)
@@ -356,7 +438,12 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       log(streamId, `Page title: ${title}`);
       log(streamId, `Collected ${interceptedVideos.length} candidate video URLs`);
 
-      // ── Cleanup ────────────────────────────────────────────────────────────
+      // ── Debug dump if nothing found ────────────────────────────────────────
+      // Runs before cleanup so the page is still accessible.
+      if (interceptedVideos.length === 0) {
+        await dumpPageDebugInfo(page, streamId, interceptedVideos.length);
+      }
+
       log(streamId, 'Initiating cleanup...');
       await context?.close().catch((e: any) =>
         log(streamId, `Context close failed: ${e.message}`, 'WARN')
@@ -369,8 +456,6 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       log(streamId, `Final result: ${filteredVideos.length} valid video URLs after filtering`);
       log(streamId, 'Scrape completed successfully');
 
-      // originalUrl is the page URL passed in — used by storage service to
-      // re-scrape a fresh video token if the current one expires before FFmpeg starts.
       return { title, originalUrl: url, videos: filteredVideos };
 
     } catch (error: any) {
