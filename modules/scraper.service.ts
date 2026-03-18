@@ -87,7 +87,7 @@ async function dumpPageDebugInfo(
         const visibleText = (clone.innerText || clone.textContent || '')
           .replace(/\s+/g, ' ')
           .trim()
-          .substring(0, 1000);
+          .substring(0, 10000);
 
         const allLinks = Array.from(document.querySelectorAll('a[href]'))
           .map(a => (a as HTMLAnchorElement).href)
@@ -265,7 +265,7 @@ async function extractStreamtapeUrl(page: any, streamId: string): Promise<string
           const hasSrc = !!(video.src || video.currentSrc || video.getAttribute('src'));
           return hasSrc;
         },
-        { timeout: 5000 }
+        { timeout: 8000 }
       ),
       5500,
       undefined
