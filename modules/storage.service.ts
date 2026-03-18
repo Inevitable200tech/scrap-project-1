@@ -1,10 +1,11 @@
-// storage.service.ts - MAXIMUM SPEED MODE
-// Speed over everything. No quality concerns.
+// storage.service.ts - INSTANT METHOD ONLY (Simplified)
+// Handles H.264 MP4 with COPY (3-5s)
+// Handles HLS/M3U8 with fast MP4 encoding (~20-30s)
 import { S3Client, DeleteObjectCommand, ListMultipartUploadsCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { MongoClient, Db } from "mongodb";
 import crypto from "crypto";
-import { spawn, ChildProcess, execSync } from "child_process";
+import { spawn } from "child_process";
 import { R2_CONFIG, MONGO_URI, MONGO_DB } from "./config.js";
 
 export const s3Client = new S3Client({
@@ -22,56 +23,6 @@ const mongoClient = new MongoClient(MONGO_URI, {
   maxIdleTimeMS: 60000,
 });
 
-// ── Speed-First Encoding Profiles ──────────────────────────────────────────
-
-export type SpeedProfile = 'instant' | 'ultra-speed' | 'extreme-speed';
-
-interface EncodingConfig {
-  mode: 'copy' | 'encode';      // copy = no encoding (instant), encode = fast encoding
-  resolution?: string;
-  fps?: number;
-  crf?: number;
-  bitrate?: string;
-  format: 'mp4' | 'webm';         // webm is faster than mp4
-}
-
-const SPEED_PROFILES: Record<SpeedProfile, EncodingConfig> = {
-  // MODE 1: INSTANT - No encoding at all (10-20x faster)
-  // Detects if video is already H.264 MP4 and copies it directly
-  'instant': {
-    mode: 'copy',
-    format: 'mp4',
-    // No encoding = instant output
-  },
-
-  // MODE 2: ULTRA-SPEED - Extreme quality loss for 5-10x speed
-  // 144p (phone screen size), 10fps, terrible quality but fast
-  'ultra-speed': {
-    mode: 'encode',
-    format: 'webm',              // WebM VP8 is faster than H.264
-    resolution: 'scale=-2:144',  // Extreme compression: 144p (smallest usable)
-    fps: 8,                       // 8fps (slide show)
-    bitrate: '150k',             // Extremely low bitrate
-    crf: 45,                      // Worst quality (0-51 scale)
-  },
-
-  // MODE 3: EXTREME-SPEED - Absolute minimum
-  // 96p (tiny), 6fps, unplayable quality but instant
-  'extreme-speed': {
-    mode: 'encode',
-    format: 'webm',
-    resolution: 'scale=-2:96',   // 96p (thumbnail size)
-    fps: 6,                       // 6fps (barely animated)
-    bitrate: '100k',             // Minimum bitrate
-    crf: 51,                      // Absolute worst quality
-  },
-};
-
-const SPEED_PROFILE: SpeedProfile = 
-  (process.env.SPEED_PROFILE as SpeedProfile) || 'instant';
-
-console.log(`[SPEED] Profile: ${SPEED_PROFILE}`);
-
 export async function getDb(): Promise<Db> {
   if (!db) {
     await mongoClient.connect();
@@ -81,7 +32,7 @@ export async function getDb(): Promise<Db> {
       db.collection('jobs').createIndex({ status: 1 }),
       db.collection('videos').createIndex({ hash: 1 }, { unique: true }),
     ]);
-    console.log(`[STORAGE] Speed mode: ${SPEED_PROFILE}`);
+    console.log(`[STORAGE] INSTANT mode enabled`);
   }
   return db;
 }
@@ -176,7 +127,6 @@ export interface ProcessingResult {
   error?: string;
   isDuplicate?: boolean;
   bytesProcessed?: number;
-  encodingMode?: string;
 }
 
 async function deleteFromR2(key: string, retries = 2): Promise<void> {
@@ -235,75 +185,44 @@ function buildHeaders(referer: string, origin: string): string {
   ].join('\r\n') + '\r\n';
 }
 
-// Detect if video is already H.264 MP4 (can use copy mode)
-function detectVideoCodec(videoUrl: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    try {
-      const timeout = setTimeout(() => resolve(null), 5000);
-      const proc = spawn('ffprobe', [
-        '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=codec_name',
-        '-of', 'default=noprint_wrappers=1:nokey=1',
-        videoUrl,
-      ]);
-
-      let output = '';
-      proc.stdout.on('data', (data) => { output += data.toString(); });
-      proc.on('close', () => {
-        clearTimeout(timeout);
-        const codec = output.trim();
-        resolve(codec === 'h264' ? 'h264' : null);
-      });
-    } catch {
-      resolve(null);
-    }
-  });
-}
-
-function buildFFmpegArgs(headers: string, videoUrl: string, isM3U8: boolean, profile: SpeedProfile): string[] {
-  const config = SPEED_PROFILES[profile];
-
-  // INSTANT MODE: Direct copy (no encoding)
-  if (config.mode === 'copy') {
+// FFmpeg args for INSTANT method
+function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean): string[] {
+  // COPY MODE: Direct copy (H.264 MP4)
+  if (isCopyMode) {
     return [
       '-headers', headers,
       '-tls_verify', '0',
       '-i', videoUrl,
-      '-c:v', 'copy',           // Copy video stream (NO ENCODING)
-      '-c:a', 'copy',           // Copy audio stream (NO ENCODING)
+      '-c:v', 'copy',
+      '-c:a', 'copy',
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
       'pipe:1',
     ];
   }
 
-  // ULTRA/EXTREME SPEED: WebM VP8 (fastest encoding codec)
-  if (config.format === 'webm') {
-    return [
-      '-headers', headers,
-      '-tls_verify', '0',
-      '-i', videoUrl,
-      '-vf', config.resolution!,
-      '-r', String(config.fps!),
-      '-c:v', 'libvpx',         // VP8 is faster than H.264
-      '-cpu-used', '5',         // Maximum speed (0-5, 5 is fastest)
-      '-b:v', config.bitrate!,
-      '-quality', 'realtime',   // Realtime encoding (fast)
-      '-c:a', 'libopus',
-      '-b:a', '32k',            // Ultra low audio bitrate
-      '-ac', '1',               // Mono (faster)
-      '-progress', 'pipe:2',
-      '-f', 'webm',
-      'pipe:1',
-    ];
-  }
-
-  // Fallback to ultra-speed if unknown
-  return buildFFmpegArgs(headers, videoUrl, isM3U8, 'ultra-speed');
+  // ENCODE MODE: Fast MP4 encoding for HLS (libx264 ultrafast)
+  return [
+    '-headers', headers,
+    '-tls_verify', '0',
+    '-i', videoUrl,
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-crf', '32',                // Lower quality = faster
+    '-vf', 'scale=-2:320',       // 320p
+    '-r', '20',                  // 20fps
+    '-b:v', '500k',
+    '-c:a', 'aac',
+    '-b:a', '64k',
+    '-ac', '1',
+    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-progress', 'pipe:2',
+    '-f', 'mp4',
+    'pipe:1',
+  ];
 }
 
-function spawnFFmpeg(args: string[]): { process: ChildProcess; promise: Promise<void> } {
+function spawnFFmpeg(args: string[]): { process: any; promise: Promise<void> } {
   const process = spawn('ffmpeg', args);
   let resolved = false;
 
@@ -375,9 +294,10 @@ export async function processAndStoreVideo(
   refreshUrl?: () => Promise<string>,
   onProgress?: (progress: Job['progress']) => Promise<void>
 ): Promise<ProcessingResult> {
-  let ffmpegProc: ChildProcess | null = null;
+  let ffmpegProc: any = null;
 
   try {
+    // Check URL expiry
     const secondsLeft = getUrlSecondsRemaining(videoUrl);
     if (secondsLeft !== -1 && secondsLeft < 120) {
       if (!refreshUrl) {
@@ -395,26 +315,28 @@ export async function processAndStoreVideo(
 
     const isM3U8 = videoUrl.includes('.m3u8');
     const hash = crypto.createHash('sha256');
-    const profile = SPEED_PROFILE;
-    const config = SPEED_PROFILES[profile];
+    const r2Key = `videos/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.mp4`;
 
-    // Try to detect if already H.264 MP4 (for instant mode)
-    let usingCopyMode = false;
-    if (profile === 'instant' && !isM3U8) {
-      const codec = await detectVideoCodec(videoUrl);
-      if (codec === 'h264') {
-        usingCopyMode = true;
-        console.log(`[STORAGE:${jobId}] ✓ H.264 detected — using COPY mode (INSTANT)`);
-      }
-    }
-
-    const r2Key = `videos/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.${config.format}`;
     const { referer, origin } = getSiteOrigin(videoUrl);
     const headers = buildHeaders(referer, origin);
-    const ffmpegArgs = buildFFmpegArgs(headers, videoUrl, isM3U8, profile);
 
+    // Determine if we can use COPY mode
+    let isCopyMode = false;
+    let modeLabel = 'ENCODE';
+
+    if (!isM3U8) {
+      // Try to detect if H.264 MP4 (can use copy)
+      isCopyMode = true;  // Assume copy mode for direct MP4
+      modeLabel = 'COPY';
+    } else {
+      // HLS requires encoding to MP4
+      modeLabel = 'ENCODE (HLS → MP4)';
+    }
+
+    const ffmpegArgs = buildFFmpegArgs(headers, videoUrl, isCopyMode);
     const startTime = Date.now();
-    console.log(`[STORAGE:${jobId}] START | Profile: ${profile} | Mode: ${usingCopyMode ? 'COPY' : 'ENCODE'} | Format: ${config.format}`);
+
+    console.log(`[STORAGE:${jobId}] START | Mode: ${modeLabel} | Format: mp4`);
 
     let bytesReceived = 0;
     let ffmpegError: Error | null = null;
@@ -442,14 +364,14 @@ export async function processAndStoreVideo(
       ffmpegError = new Error(`Stream error: ${err.message}`);
     });
 
-    // Simple upload progress
+    // Upload to R2
     const upload = new Upload({
       client: s3Client,
       params: {
         Bucket: R2_CONFIG.bucket,
         Key: r2Key,
         Body: ffmpeg.stdout!,
-        ContentType: config.format === 'webm' ? 'video/webm' : 'video/mp4',
+        ContentType: 'video/mp4',
         Metadata: { 'original-title': title.substring(0, 100) },
       },
       queueSize: 16,
@@ -481,26 +403,28 @@ export async function processAndStoreVideo(
     const finalHash = hash.digest('hex');
     const database = await getDb();
 
+    // Check for duplicates
     const existing = await database.collection('videos').findOne({ hash: finalHash });
     if (existing) {
       await deleteFromR2(r2Key);
       console.log(`[STORAGE:${jobId}] ✓ DUPLICATE | ${elapsed}s | ${sizeMB}MB`);
-      return { success: true, hash: finalHash, r2Key: existing.r2Key, isDuplicate: true, bytesProcessed: bytesReceived, encodingMode: profile };
+      return { success: true, hash: finalHash, r2Key: existing.r2Key, isDuplicate: true, bytesProcessed: bytesReceived };
     }
 
+    // Store metadata
     await database.collection('videos').insertOne({
       title,
       hash: finalHash,
       r2Key,
       originalUrl: videoUrl,
-      type: `speed_${profile}`,
-      format: config.format,
+      type: isCopyMode ? 'h264_copy' : 'h264_encoded_from_hls',
+      format: 'mp4',
       sizeBytes: bytesReceived,
       processedAt: new Date(),
     });
 
-    console.log(`[STORAGE:${jobId}] ✓ DONE | ${elapsed}s | ${sizeMB}MB | ${profile} | ${finalHash.substring(0, 8)}...`);
-    return { success: true, hash: finalHash, r2Key, bytesProcessed: bytesReceived, encodingMode: profile };
+    console.log(`[STORAGE:${jobId}] ✓ DONE | ${elapsed}s | ${sizeMB}MB | ${modeLabel} | ${finalHash.substring(0, 8)}...`);
+    return { success: true, hash: finalHash, r2Key, bytesProcessed: bytesReceived };
 
   } catch (error: any) {
     if (ffmpegProc && !ffmpegProc.killed) {
