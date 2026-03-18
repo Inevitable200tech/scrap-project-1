@@ -179,7 +179,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
     let page: any = null;
 
     try {
-      log(streamId, 'Launching browser...');
+     // log(streamId, 'Launching browser...');
       browser = await playwrightExtra.chromium.launch({
         headless: true,
         args: [
@@ -192,17 +192,17 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
           '--disable-blink-features=AutomationControlled',
         ],
       });
-      log(streamId, 'Browser launched successfully');
+    //  log(streamId, 'Browser launched successfully');
 
-      log(streamId, 'Creating new browser context...');
+    //  log(streamId, 'Creating new browser context...');
       context = await browser.newContext({
         viewport: { width: 1280, height: 900 },
         userAgent:
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       });
-      log(streamId, 'Browser context created');
+      //log(streamId, 'Browser context created');
 
-      log(streamId, 'Opening primary page...');
+     // log(streamId, 'Opening primary page...');
       page = await context.newPage();
       log(streamId, 'Primary page opened');
 
@@ -269,7 +269,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       if (!isStreamtape && !isVidara) {
         await page.waitForTimeout(3500).catch(() => {});
       }
-      log(streamId, 'Navigation phase completed');
+     // log(streamId, 'Navigation phase completed');
 
       // ── Universal dead video check ─────────────────────────────────────────
       const pageHtml = isPageAlive(page)
@@ -444,7 +444,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         await dumpPageDebugInfo(page, streamId, interceptedVideos.length);
       }
 
-      log(streamId, 'Initiating cleanup...');
+     // log(streamId, 'Initiating cleanup...');
       await context?.close().catch((e: any) =>
         log(streamId, `Context close failed: ${e.message}`, 'WARN')
       );
@@ -453,7 +453,7 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       );
 
       const filteredVideos = filterVideoUrls(interceptedVideos, url);
-      log(streamId, `Final result: ${filteredVideos.length} valid video URLs after filtering`);
+      // log(streamId, `Final result: ${filteredVideos.length} valid video URLs after filtering`);
       log(streamId, 'Scrape completed successfully');
 
       return { title, originalUrl: url, videos: filteredVideos };

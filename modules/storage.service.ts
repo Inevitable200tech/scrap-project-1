@@ -223,10 +223,10 @@ export async function processAndStoreVideo(
     // ── Expiry check ───────────────────────────────────────────────────────
     const secondsLeft = getUrlSecondsRemaining(videoUrl);
     if (secondsLeft !== -1) {
-      console.log(`[STORAGE] URL token expires in ${secondsLeft}s`);
+     // console.log(`[STORAGE] URL token expires in ${secondsLeft}s`);
       if (secondsLeft < 60) {
         if (refreshUrl) {
-          console.log(`[STORAGE] URL expiring soon — re-scraping...`);
+        //  console.log(`[STORAGE] URL expiring soon — re-scraping...`);
           try {
             videoUrl = await refreshUrl();
             console.log(`[STORAGE] Fresh URL: ${videoUrl.substring(0, 80)}...`);
