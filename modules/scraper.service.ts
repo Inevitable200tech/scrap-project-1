@@ -9,6 +9,9 @@ export interface ScrapeResult {
   originalUrl: string;
   videos: { site: string; url: string }[];
   dead?: boolean;
+  // Structured failure reason — consumed by main.ts to set job.failureReason
+  // without fragile error string matching.
+  deadReason?: string;
 }
 
 function log(streamId: string, message: string, level: 'INFO' | 'WARN' | 'ERROR' = 'INFO') {
@@ -72,7 +75,6 @@ async function dumpPageDebugInfo(
 
   try {
     const debugInfo = await page.evaluate(() => {
-      // Visible text — strip scripts/styles then get innerText
       const clone = document.body.cloneNode(true) as HTMLElement;
       clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
       const visibleText = (clone.innerText || clone.textContent || '')
@@ -80,19 +82,16 @@ async function dumpPageDebugInfo(
         .trim()
         .substring(0, 1000);
 
-      // All links on the page
       const allLinks = Array.from(document.querySelectorAll('a[href]'))
         .map(a => (a as HTMLAnchorElement).href)
         .filter(h => h.startsWith('http'))
         .slice(0, 20);
 
-      // iframes
       const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
         src: f.src || f.getAttribute('src'),
         id: f.id,
       }));
 
-      // Video elements
       const videos = Array.from(document.querySelectorAll('video')).map(v => ({
         src: v.src,
         currentSrc: v.currentSrc,
@@ -100,7 +99,6 @@ async function dumpPageDebugInfo(
         readyState: v.readyState,
       }));
 
-      // Common error/message containers
       const errorSelectors = [
         '.error', '.message', '.alert', '.notice',
         '[class*="error"]', '[class*="empty"]', '[class*="not-found"]',
@@ -281,7 +279,13 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
         log(streamId, `Dead video detected (matched: ${deadReason}) — aborting`, 'WARN');
         await context?.close().catch(() => {});
         await browser?.close().catch(() => {});
-        return { title: 'Dead Video', originalUrl: url, videos: [], dead: true };
+        return {
+          title: 'Dead Video',
+          originalUrl: url,
+          videos: [],
+          dead: true,
+          deadReason,
+        };
       }
 
       // ── Player-specific extraction ─────────────────────────────────────────
@@ -439,7 +443,6 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
       log(streamId, `Collected ${interceptedVideos.length} candidate video URLs`);
 
       // ── Debug dump if nothing found ────────────────────────────────────────
-      // Runs before cleanup so the page is still accessible.
       if (interceptedVideos.length === 0) {
         await dumpPageDebugInfo(page, streamId, interceptedVideos.length);
       }

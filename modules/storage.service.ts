@@ -34,11 +34,20 @@ export async function getDb() {
 // ── Job types ──────────────────────────────────────────────────────────────
 export type JobStatus = 'pending' | 'scraping' | 'storing' | 'done' | 'failed';
 
+export type JobFailureReason =
+  | 'dead_video'     // video removed/deleted at source
+  | 'no_video_found' // scraper found no extractable URL
+  | 'ffmpeg_failed'  // encode/upload failed
+  | 'expired_url'    // token expired before FFmpeg could start
+  | 'scrape_error'   // browser/network error during scrape
+  | 'unknown';       // anything else
+
 export interface Job {
   jobId: string;
   url: string;
   title?: string;
   status: JobStatus;
+  failureReason?: JobFailureReason; // set when status === 'failed'
   createdAt: Date;
   updatedAt: Date;
   result?: {

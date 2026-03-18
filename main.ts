@@ -12,6 +12,7 @@ import {
   updateJob,
   listJobs,
   cleanupIncompleteMultipartUploads,
+  JobFailureReason,
 } from './modules/storage.service.js';
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
@@ -25,16 +26,12 @@ const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, '../public')));
 
 // ── Serial job queue ───────────────────────────────────────────────────────
-// Jobs are processed one at a time in the order they are submitted.
-// This eliminates CPU/bandwidth contention from parallel FFmpeg processes
-// and prevents Streamtape rate limiting from concurrent browser instances.
 const jobQueue: string[] = [];
 let isProcessing = false;
 
 async function enqueueJob(jobId: string): Promise<void> {
   jobQueue.push(jobId);
   console.log(`[QUEUE] Job ${jobId} enqueued — position ${jobQueue.length}`);
-  // Kick off the processor if it's idle
   if (!isProcessing) {
     processNextJob();
   }
@@ -57,16 +54,12 @@ async function processNextJob(): Promise<void> {
     console.error(`[QUEUE] Job ${jobId} threw unhandled error: ${err.message}`);
   }
 
-  // ✅ await ensures the next job only starts after the current one
-  // fully completes — including the FFmpeg encode and R2 upload
   await processNextJob();
 }
 
 // ── Per-host cooldown ──────────────────────────────────────────────────────
-// Extra protection against rate limiting even in serial mode —
-// if the same host appears back to back, enforce a minimum gap.
 const hostLastScraped = new Map<string, number>();
-const HOST_COOLDOWN_MS = 10_000; // 10s between scrapes of the same host
+const HOST_COOLDOWN_MS = 10_000;
 
 async function enforceHostCooldown(url: string): Promise<void> {
   try {
@@ -96,26 +89,64 @@ async function processJob(jobId: string): Promise<void> {
     await updateJob(jobId, { status: 'scraping' });
     await enforceHostCooldown(job.url);
 
-    let scrapeResult: ScrapeResult = await performScrape(job.url, streamId);
-
-    if (!scrapeResult?.videos?.length) {
-      console.log(`[JOB:${jobId}] No videos on first attempt, retrying in 30s...`);
-      await new Promise(r => setTimeout(r, 30_000));
+    let scrapeResult: ScrapeResult;
+    try {
       scrapeResult = await performScrape(job.url, streamId);
-    }
-
-    if (!scrapeResult?.videos?.length) {
-      await updateJob(jobId, { status: 'failed', error: 'No videos found after retry' });
-      return;
-    }
-
-    // Dead video check
-    if ((scrapeResult as any).dead) {
+    } catch (scrapeErr: any) {
       await updateJob(jobId, {
         status: 'failed',
-        error: 'Video has been removed by the uploader',
+        failureReason: 'scrape_error',
+        error: scrapeErr.message,
       });
       return;
+    }
+
+    // Dead video — confirmed gone at source
+    if (scrapeResult.dead) {
+      await updateJob(jobId, {
+        status: 'failed',
+        failureReason: 'dead_video',
+        error: `Video has been removed (matched: ${scrapeResult.deadReason ?? 'unknown'})`,
+      });
+      return;
+    }
+
+    // No video URL found on first attempt — retry once
+    if (!scrapeResult.videos?.length) {
+      console.log(`[JOB:${jobId}] No videos on first attempt, retrying in 30s...`);
+      await new Promise(r => setTimeout(r, 30_000));
+
+      let retryResult: ScrapeResult;
+      try {
+        retryResult = await performScrape(job.url, streamId);
+      } catch (retryErr: any) {
+        await updateJob(jobId, {
+          status: 'failed',
+          failureReason: 'scrape_error',
+          error: retryErr.message,
+        });
+        return;
+      }
+
+      if (retryResult.dead) {
+        await updateJob(jobId, {
+          status: 'failed',
+          failureReason: 'dead_video',
+          error: `Video has been removed (matched: ${retryResult.deadReason ?? 'unknown'})`,
+        });
+        return;
+      }
+
+      if (!retryResult.videos?.length) {
+        await updateJob(jobId, {
+          status: 'failed',
+          failureReason: 'no_video_found',
+          error: 'No video URL found after two scrape attempts',
+        });
+        return;
+      }
+
+      scrapeResult = retryResult;
     }
 
     const videoUrl = scrapeResult.videos[0].url;
@@ -138,7 +169,14 @@ async function processJob(jobId: string): Promise<void> {
     );
 
     if (!storageResult.success) {
-      await updateJob(jobId, { status: 'failed', error: storageResult.error });
+      const failureReason: JobFailureReason =
+        storageResult.error?.includes('expired') ? 'expired_url' : 'ffmpeg_failed';
+
+      await updateJob(jobId, {
+        status: 'failed',
+        failureReason,
+        error: storageResult.error,
+      });
       return;
     }
 
@@ -171,7 +209,11 @@ async function processJob(jobId: string): Promise<void> {
 
   } catch (error: any) {
     console.error(`[JOB:${jobId}] Failed: ${error.message}`);
-    await updateJob(jobId, { status: 'failed', error: error.message });
+    await updateJob(jobId, {
+      status: 'failed',
+      failureReason: 'unknown',
+      error: error.message,
+    });
   }
 }
 
@@ -210,12 +252,17 @@ app.get('/api/scrape/status/:jobId', async (req, res): Promise<any> => {
       status: job.status,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
-      // Show queue position if still waiting (-1 means currently processing or done)
       queuePosition: queuePosition >= 0 ? queuePosition + 1 : null,
     };
 
-    if (job.status === 'done')   response.result = job.result;
-    if (job.status === 'failed') response.error  = job.error;
+    if (job.status === 'done') {
+      response.result = job.result;
+    }
+
+    if (job.status === 'failed') {
+      response.error         = job.error;
+      response.failureReason = job.failureReason ?? 'unknown';
+    }
 
     return res.json(response);
   } catch (error: any) {
@@ -230,6 +277,7 @@ app.get('/api/scrape/jobs', async (req, res): Promise<any> => {
       jobId: j.jobId,
       url: j.url,
       status: j.status,
+      failureReason: j.failureReason,
       createdAt: j.createdAt,
       updatedAt: j.updatedAt,
       error: j.error,
@@ -239,7 +287,6 @@ app.get('/api/scrape/jobs', async (req, res): Promise<any> => {
   }
 });
 
-// Queue status endpoint
 app.get('/api/queue', (req, res) => {
   res.json({
     isProcessing,
@@ -311,7 +358,6 @@ app.listen(PORT, '0.0.0.0', async () => {
   try {
     await getDb();
 
-    // R2 multipart cleanup — runs at startup and every 6 hours
     cleanupIncompleteMultipartUploads().catch(console.error);
     setInterval(() => {
       cleanupIncompleteMultipartUploads().catch(console.error);
