@@ -1,20 +1,11 @@
-// storage.service.ts - INSTANT METHOD ONLY (Simplified)
+// storage.service.ts - Upload to Main Instance
 // Handles H.264 MP4 with COPY (3-5s)
 // Handles HLS/M3U8 with fast MP4 encoding (~20-30s)
-import { S3Client, DeleteObjectCommand, ListMultipartUploadsCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
-import { Upload } from "@aws-sdk/lib-storage";
+// Uploads to main instance via /api/upload instead of direct R2
 import { MongoClient, Db } from "mongodb";
 import crypto from "crypto";
-import { spawn, ChildProcess } from "child_process";
-import { R2_CONFIG, MONGO_URI, MONGO_DB } from "./config.js";
-
-export const s3Client = new S3Client({
-  region: "auto",
-  endpoint: R2_CONFIG.endpoint,
-  credentials: R2_CONFIG.credentials,
-  maxAttempts: 5,
-  requestHandler: { requestTimeout: 300000 },
-});
+import { spawn } from "child_process";
+import { MAIN_INSTANCE, MONGO_URI, MONGO_DB } from "./config.js";
 
 let db: Db;
 const mongoClient = new MongoClient(MONGO_URI, {
@@ -32,7 +23,7 @@ export async function getDb(): Promise<Db> {
       db.collection('jobs').createIndex({ status: 1 }),
       db.collection('videos').createIndex({ hash: 1 }, { unique: true }),
     ]);
-    console.log(`[STORAGE] INSTANT mode enabled`);
+    console.log(`[STORAGE] INSTANT mode enabled (uploading to main instance)`);
   }
   return db;
 }
@@ -55,7 +46,6 @@ export interface Job {
   };
   result?: {
     title: string;
-    r2Key?: string;
     hash?: string;
     isDuplicate?: boolean;
     playUrl?: string;
@@ -123,23 +113,9 @@ export async function resetJobToPending(jobId: string): Promise<void> {
 export interface ProcessingResult {
   success: boolean;
   hash?: string;
-  r2Key?: string;
   error?: string;
   isDuplicate?: boolean;
   bytesProcessed?: number;
-}
-
-async function deleteFromR2(key: string, retries = 2): Promise<void> {
-  let lastError;
-  for (let i = 0; i < retries; i++) {
-    try {
-      await s3Client.send(new DeleteObjectCommand({ Bucket: R2_CONFIG.bucket, Key: key }));
-      return;
-    } catch (err: any) {
-      lastError = err;
-      if (i < retries - 1) await new Promise(r => setTimeout(r, 100 * Math.pow(2, i)));
-    }
-  }
 }
 
 function getUrlSecondsRemaining(videoUrl: string): number {
@@ -245,46 +221,69 @@ function spawnFFmpeg(args: string[]): { process: any; promise: Promise<void> } {
   return { process, promise };
 }
 
-export async function cleanupIncompleteMultipartUploads(olderThanMs = 60 * 60 * 1000): Promise<{ aborted: number; errors: number }> {
-  let aborted = 0;
-  let errors = 0;
-  let isTruncated = true;
-  let keyMarker: string | undefined;
-  let uploadIdMarker: string | undefined;
+// ============ UPLOAD TO MAIN INSTANCE ============
+async function uploadToMainInstance(
+  fileBuffer: Buffer,
+  fileName: string,
+  title: string,
+  hash: string
+): Promise<{ success: boolean; hash?: string; isDuplicate?: boolean; error?: string }> {
+  try {
+    const formData = new FormData();
 
-  while (isTruncated) {
-    let response;
-    try {
-      response = await s3Client.send(new ListMultipartUploadsCommand({
-        Bucket: R2_CONFIG.bucket,
-        KeyMarker: keyMarker,
-        UploadIdMarker: uploadIdMarker,
-      }));
-    } catch (err: any) {
-      break;
+    // Append file as Blob
+    const uint8Array = new Uint8Array(fileBuffer);
+    const blob = new Blob([uint8Array], { type: 'video/mp4' });
+
+    // Append metadata
+    formData.append('hash', hash);
+    formData.append('title', title || fileName);
+
+    console.log(`[MAIN-UPLOAD] 📤 Uploading to main instance: ${MAIN_INSTANCE.url}/api/upload`);
+    console.log(`[MAIN-UPLOAD]    File: ${fileName}`);
+    console.log(`[MAIN-UPLOAD]    Title: ${title}`);
+    console.log(`[MAIN-UPLOAD]    Size: ${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+
+    const uploadUrl = `${MAIN_INSTANCE.url}/api/upload`;
+    const response = await fetch(uploadUrl, {
+      method: 'POST',
+      body: formData,
+      // Note: FormData automatically sets multipart/form-data header
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`HTTP ${response.status}: ${error}`);
     }
 
-    const cutoff = Date.now() - olderThanMs;
-    const abortPromises = [];
+    const result = await response.json();
 
-    for (const { Key, UploadId, Initiated } of response.Uploads ?? []) {
-      if (Initiated && Initiated.getTime() > cutoff) continue;
-      abortPromises.push(
-        s3Client.send(new AbortMultipartUploadCommand({
-          Bucket: R2_CONFIG.bucket, Key: Key!, UploadId: UploadId!,
-        }))
-          .then(() => { aborted++; })
-          .catch(() => { errors++; })
-      );
+    if (response.status === 200) {
+      // 200 = duplicate file
+      console.log(`[MAIN-UPLOAD] ✓ DUPLICATE | Hash: ${result.hash}`);
+      return {
+        success: true,
+        hash: result.hash,
+        isDuplicate: true,
+      };
+    } else if (response.status === 202) {
+      // 202 = async processing started
+      console.log(`[MAIN-UPLOAD] ✓ QUEUED | Hash: ${result.hash} | Poll: ${result.pollUrl}`);
+      return {
+        success: true,
+        hash: result.hash,
+        isDuplicate: false,
+      };
+    } else {
+      throw new Error(`Unexpected status ${response.status}`);
     }
-
-    if (abortPromises.length > 0) await Promise.all(abortPromises);
-    isTruncated = response.IsTruncated ?? false;
-    keyMarker = response.NextKeyMarker;
-    uploadIdMarker = response.NextUploadIdMarker;
+  } catch (error: any) {
+    console.error(`[MAIN-UPLOAD] ❌ Error: ${error.message}`);
+    return {
+      success: false,
+      error: error.message,
+    };
   }
-
-  return { aborted, errors };
 }
 
 export async function processAndStoreVideo(
@@ -315,7 +314,6 @@ export async function processAndStoreVideo(
 
     const isM3U8 = videoUrl.includes('.m3u8');
     const hash = crypto.createHash('sha256');
-    const r2Key = `videos/${Date.now()}-${crypto.randomBytes(4).toString('hex')}.mp4`;
 
     const { referer, origin } = getSiteOrigin(videoUrl);
     const headers = buildHeaders(referer, origin);
@@ -340,6 +338,7 @@ export async function processAndStoreVideo(
 
     let bytesReceived = 0;
     let ffmpegError: Error | null = null;
+    let fileBuffer = Buffer.alloc(0);
 
     const { process: ffmpeg, promise: ffmpegPromise } = spawnFFmpeg(ffmpegArgs);
     ffmpegProc = ffmpeg;
@@ -355,8 +354,10 @@ export async function processAndStoreVideo(
       if (text.includes('Error')) console.error(`[FFMPEG:${jobId}]: ${text.trim()}`);
     });
 
+    // Collect all chunks into buffer for upload
     ffmpeg.stdout!.on('data', (chunk: Buffer) => {
       hash.update(chunk);
+      fileBuffer = Buffer.concat([fileBuffer, chunk]);
       bytesReceived += chunk.length;
     });
 
@@ -364,73 +365,73 @@ export async function processAndStoreVideo(
       ffmpegError = new Error(`Stream error: ${err.message}`);
     });
 
-    // Upload to R2
-    // Sanitize title for metadata header (only alphanumeric, hyphens, underscores)
-    const sanitizedTitle = title
-      .substring(0, 100)
-      .replace(/[^a-zA-Z0-9\-_]/g, '_')  // Replace invalid chars with underscore
-      .replace(/_{2,}/g, '_');            // Replace multiple underscores with single
-
-    const upload = new Upload({
-      client: s3Client,
-      params: {
-        Bucket: R2_CONFIG.bucket,
-        Key: r2Key,
-        Body: ffmpeg.stdout!,
-        ContentType: 'video/mp4',
-        Metadata: { 'original-title': sanitizedTitle },
-      },
-      queueSize: 16,
-      partSize: 52428800,
-      leavePartsOnError: false,
-    });
-
-    const [uploadResult] = await Promise.allSettled([
-      upload.done(),
-      ffmpegPromise,
-    ]);
+    // Wait for FFmpeg to complete
+    await Promise.allSettled([ffmpegPromise]);
 
     clearTimeout(ffmpegTimeoutHandle);
 
     if (ffmpegError) throw ffmpegError;
-    if (uploadResult.status === 'rejected') throw uploadResult.reason;
     if (bytesReceived === 0) {
-      await deleteFromR2(r2Key);
       return { success: false, error: 'No video data' };
+    }
+
+    const finalHash = hash.digest('hex');
+
+    if (onProgress) {
+      onProgress({ stage: 'uploading', percent: 75, bytesProcessed: bytesReceived }).catch(() => { });
+    }
+
+    // Upload to main instance
+    const uploadResult = await uploadToMainInstance(
+      fileBuffer,
+      `${finalHash}.mp4`,
+      title,
+      finalHash
+    );
+
+    if (!uploadResult.success) {
+      return {
+        success: false,
+        error: uploadResult.error || 'Upload failed',
+      };
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     const sizeMB = (bytesReceived / 1024 / 1024).toFixed(2);
 
     if (onProgress) {
-      onProgress({ stage: 'complete', percent: 100, bytesProcessed: bytesReceived }).catch(() => {});
+      onProgress({ stage: 'complete', percent: 100, bytesProcessed: bytesReceived }).catch(() => { });
     }
 
-    const finalHash = hash.digest('hex');
+    // Store metadata locally (reference to main instance)
     const database = await getDb();
-
-    // Check for duplicates
     const existing = await database.collection('videos').findOne({ hash: finalHash });
+
     if (existing) {
-      await deleteFromR2(r2Key);
       console.log(`[STORAGE:${jobId}] ✓ DUPLICATE | ${elapsed}s | ${sizeMB}MB`);
-      return { success: true, hash: finalHash, r2Key: existing.r2Key, isDuplicate: true, bytesProcessed: bytesReceived };
+      return {
+        success: true,
+        hash: finalHash,
+        isDuplicate: true,
+        bytesProcessed: bytesReceived,
+      };
     }
 
-    // Store metadata
+    // Store metadata locally
     await database.collection('videos').insertOne({
       title,
       hash: finalHash,
-      r2Key,
       originalUrl: videoUrl,
       type: isCopyMode ? 'h264_copy' : 'h264_encoded_from_hls',
       format: 'mp4',
       sizeBytes: bytesReceived,
       processedAt: new Date(),
+      uploadedToMain: true,
+      mainInstanceUrl: MAIN_INSTANCE.url,
     });
 
     console.log(`[STORAGE:${jobId}] ✓ DONE | ${elapsed}s | ${sizeMB}MB | ${modeLabel} | ${finalHash.substring(0, 8)}...`);
-    return { success: true, hash: finalHash, r2Key, bytesProcessed: bytesReceived };
+    return { success: true, hash: finalHash, bytesProcessed: bytesReceived };
 
   } catch (error: any) {
     if (ffmpegProc && !ffmpegProc.killed) {

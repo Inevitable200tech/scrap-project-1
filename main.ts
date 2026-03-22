@@ -1,4 +1,4 @@
-// main.ts - Updated with progress tracking
+// main.ts - Updated with progress tracking + Main Instance integration
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -6,18 +6,13 @@ import { performScrape, ScrapeResult } from './modules/scraper.service.js';
 import {
   processAndStoreVideo,
   getDb,
-  s3Client,
   createJob,
   getJob,
   updateJob,
   listJobs,
-  cleanupIncompleteMultipartUploads,
   JobFailureReason,
-  Job,
 } from './modules/storage.service.js';
-import { GetObjectCommand } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { PORT, R2_CONFIG } from './modules/config.js';
+import { PORT, MAIN_INSTANCE } from './modules/config.js';
 
 const app = express();
 app.use(express.json());
@@ -186,7 +181,7 @@ async function processJob(jobId: string): Promise<void> {
 
     if (!storageResult.success) {
       const failureReason: JobFailureReason =
-        storageResult.error?.includes('expired') ? 'expired_url' : 'ffmpeg_failed';
+        storageResult.error?.includes('expired') ? 'expired_url' : 'upload_failed';
 
       await updateJob(jobId, {
         status: 'failed',
@@ -196,17 +191,23 @@ async function processJob(jobId: string): Promise<void> {
       return;
     }
 
-    // ── Step 3: Generate signed play URL ─────────────────────────────────
+    // ── Step 3: Fetch video metadata from main instance ──────────────────
     let playUrl: string | undefined;
-    if (storageResult.r2Key) {
+    if (storageResult.hash) {
       try {
-        const command = new GetObjectCommand({
-          Bucket: R2_CONFIG.bucket,
-          Key: storageResult.r2Key,
-        });
-        playUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+        console.log(`[JOB:${jobId}] Fetching video info from main instance...`);
+        const fileInfoUrl = `${MAIN_INSTANCE.url}/api/file/${storageResult.hash}`;
+        const fileResponse = await fetch(fileInfoUrl);
+        
+        if (fileResponse.ok) {
+          const fileData = await fileResponse.json();
+          playUrl = fileData.download?.url;
+          console.log(`[JOB:${jobId}] Got play URL from main instance`);
+        } else {
+          console.warn(`[JOB:${jobId}] Failed to get file info: ${fileResponse.status}`);
+        }
       } catch (e: any) {
-        console.error(`[JOB:${jobId}] Failed to generate play URL: ${e.message}`);
+        console.error(`[JOB:${jobId}] Failed to fetch file info: ${e.message}`);
       }
     }
 
@@ -215,7 +216,6 @@ async function processJob(jobId: string): Promise<void> {
       progress: { stage: 'complete', percent: 100 },
       result: {
         title: job.title || scrapeResult.title,
-        r2Key: storageResult.r2Key,
         hash: storageResult.hash,
         isDuplicate: storageResult.isDuplicate,
         playUrl,
@@ -270,7 +270,7 @@ app.get('/api/scrape/status/:jobId', async (req, res): Promise<any> => {
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
       queuePosition: queuePosition >= 0 ? queuePosition + 1 : null,
-      progress: job.progress,  // NEW: Include progress
+      progress: job.progress,
     };
 
     if (job.status === 'done') {
@@ -299,7 +299,7 @@ app.get('/api/scrape/jobs', async (req, res): Promise<any> => {
       createdAt: j.createdAt,
       updatedAt: j.updatedAt,
       error: j.error,
-      progress: j.progress,  // NEW: Include progress
+      progress: j.progress,
     })));
   } catch (error: any) {
     return res.status(500).json({ error: error.message });
@@ -332,7 +332,7 @@ app.post('/api/login', (req, res): any => {
   return res.status(401).json({ error: 'Invalid PIN' });
 });
 
-// ── Videos gallery ─────────────────────────────────────────────────────────
+// ── Videos gallery (fetch from main instance) ──────────────────────────────
 app.get('/api/videos', async (req, res): Promise<any> => {
   const authHeader = req.headers['authorization'];
   if (authHeader !== process.env.DASHBOARD_PIN) {
@@ -340,26 +340,53 @@ app.get('/api/videos', async (req, res): Promise<any> => {
   }
 
   try {
-    const db = await getDb();
-    const videos = await db.collection('videos')
-      .find()
-      .sort({ processedAt: -1 })
-      .limit(50)
-      .toArray();
-
-    if (!videos || videos.length === 0) return res.json([]);
-
-    const playableVideos = await Promise.all(videos.map(async (video) => {
-      try {
-        const command = new GetObjectCommand({ Bucket: R2_CONFIG.bucket, Key: video.r2Key });
-        const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 3600 });
-        return { ...video, playUrl: signedUrl };
-      } catch (e) {
-        return { ...video, playUrl: null, error: 'Link failed' };
+    // Fetch videos from main instance
+    console.log(`[VIDEOS] Fetching from main instance: ${MAIN_INSTANCE.url}/api/files`);
+    const mainResponse = await fetch(`${MAIN_INSTANCE.url}/api/files`, {
+      headers: {
+        'Authorization': `Bearer ${process.env.MAIN_INSTANCE_AUTH_TOKEN || 'default-token'}`,
       }
+    });
+
+    if (!mainResponse.ok) {
+      console.error(`[VIDEOS] Failed to fetch from main instance: ${mainResponse.status}`);
+      return res.status(500).json({ error: 'Failed to fetch videos from main instance' });
+    }
+
+    const mainData = await mainResponse.json();
+    const files = mainData.files || [];
+
+    if (!files || files.length === 0) {
+      return res.json([]);
+    }
+
+    // Map main instance format to gallery format
+    const videoList = files.map((file: any) => ({
+      _id: file.hash,
+      hash: file.hash,
+      filename: file.filename,
+      title: file.title || file.filename,
+      fileSize: file.size,
+      processedAt: file.created_at,
+      type: 'mp4',
+      playUrl: `${MAIN_INSTANCE.url}/api/file/${file.hash}`, // Will fetch signed URL when needed
     }));
 
-    return res.json(playableVideos);
+    // Enhance with signed URLs from main instance
+    const videoListWithUrls = await Promise.all(videoList.map(async (video: any) => {
+      try {
+        const fileResponse = await fetch(`${MAIN_INSTANCE.url}/api/file/${video.hash}`);
+        if (fileResponse.ok) {
+          const fileData = await fileResponse.json();
+          video.playUrl = fileData.download?.url;
+        }
+      } catch (e) {
+        console.warn(`Failed to get signed URL for ${video.hash}`);
+      }
+      return video;
+    }));
+
+    return res.json(videoListWithUrls);
   } catch (error: any) {
     console.error('[API ERROR]', error);
     return res.status(500).json({ error: error.message });
@@ -377,15 +404,12 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
+  console.log(`🎥 Gallery: http://localhost:${PORT}/gallery`);
+  console.log(`📡 Main Instance: ${MAIN_INSTANCE.url}`);
 
   try {
     await getDb();
-
-    cleanupIncompleteMultipartUploads().catch(console.error);
-    setInterval(() => {
-      cleanupIncompleteMultipartUploads().catch(console.error);
-    }, 6 * 60 * 60 * 1000);
-
+    console.log(`✅ Connected to MongoDB`);
   } catch (err) {
     console.error('FATAL: Could not initialize. Process exiting.');
     process.exit(1);

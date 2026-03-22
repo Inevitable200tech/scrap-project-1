@@ -26,15 +26,12 @@ export const BROWSER_ARGS = [
     '--disable-blink-features=AutomationControlled',
 ];
 
-// --- Configuration ---
-export const R2_CONFIG = {
-    endpoint: `https://${requireEnv('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com`,
-    bucket: requireEnv('R2_BUCKET_NAME'),
-    credentials: {
-        accessKeyId: requireEnv('R2_ACCESS_KEY_ID'),
-        secretAccessKey: requireEnv('R2_SECRET_ACCESS_KEY'),
-    },
+// --- Main Instance Configuration (Upload destination) ---
+export const MAIN_INSTANCE = {
+    url: requireEnv('MAIN_INSTANCE_URL'),  // e.g., http://localhost:3000
+    apiKey: process.env.MAIN_INSTANCE_API_KEY || 'default-api-key',  // Optional: for auth if needed
 };
 
+// --- MongoDB Configuration (Local storage for scraper metadata) ---
 export const MONGO_URI = requireEnv('MONGODB_URI');
 export const MONGO_DB = requireEnv('MONGODB_DB_NAME');
