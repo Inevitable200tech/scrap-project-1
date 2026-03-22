@@ -112,6 +112,7 @@ const DEAD_VIDEO_SIGNALS = [
   /this file (no longer exists|has been removed)/i,
   /file (was|has been) (deleted|removed)/i,
   /This video has been removed due to term violence./i,
+  /Processing Downloading your video/i
 ];
 
 function detectDeadVideo(httpStatus: number, html: string): string | null {

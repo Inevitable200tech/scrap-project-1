@@ -238,7 +238,7 @@ async function uploadToMainInstance(
     // Append metadata
     formData.append('hash', hash);
     formData.append('title', title || fileName);
-
+    formData.append('file', blob, fileName)
     console.log(`[MAIN-UPLOAD] 📤 Uploading to main instance: ${MAIN_INSTANCE.url}/api/upload`);
     console.log(`[MAIN-UPLOAD]    File: ${fileName}`);
     console.log(`[MAIN-UPLOAD]    Title: ${title}`);
