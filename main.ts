@@ -205,8 +205,13 @@ async function processJob(jobId: string): Promise<void> {
         
         if (fileResponse.ok) {
           const fileData = await fileResponse.json();
-          playUrl = fileData.download?.url;
-          console.log(`[JOB:${jobId}] Got play URL from main instance`);
+          // ✅ Only set if we got a valid signed URL
+          if (fileData.download?.url) {
+            playUrl = fileData.download.url;
+            console.log(`[JOB:${jobId}] ✓ Got signed URL from main instance`);
+          } else {
+            console.warn(`[JOB:${jobId}] No signed URL in response, will use API endpoint`);
+          }
         } else {
           console.warn(`[JOB:${jobId}] Failed to get file info: ${fileResponse.status}`);
         }
@@ -398,10 +403,18 @@ app.get('/api/videos', async (req, res): Promise<any> => {
         );
         if (fileResponse.ok) {
           const fileData = await fileResponse.json();
-          video.playUrl = fileData.download?.url;
+          // ✅ Only update if we got a valid signed URL
+          if (fileData.download?.url) {
+            video.playUrl = fileData.download.url;
+            console.log(`[VIDEOS] Got signed URL for ${video.hash.substring(0, 8)}...`);
+          } else {
+            console.warn(`[VIDEOS] No signed URL in response for ${video.hash.substring(0, 8)}... using API endpoint`);
+          }
+        } else {
+          console.warn(`[VIDEOS] Failed to fetch file info for ${video.hash.substring(0, 8)}...: ${fileResponse.status}`);
         }
-      } catch (e) {
-        console.warn(`Failed to get signed URL for ${video.hash}`);
+      } catch (e: any) {
+        console.warn(`[VIDEOS] Error fetching signed URL for ${video.hash.substring(0, 8)}...: ${e.message}`);
       }
       return video;
     }));
