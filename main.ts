@@ -196,8 +196,12 @@ async function processJob(jobId: string): Promise<void> {
     if (storageResult.hash) {
       try {
         console.log(`[JOB:${jobId}] Fetching video info from main instance...`);
-        const fileInfoUrl = `${MAIN_INSTANCE.url}/api/file/${storageResult.hash}`;
-        const fileResponse = await fetch(fileInfoUrl);
+        const fileInfoUrl = `${MAIN_INSTANCE.url}/api/public/file/${storageResult.hash}`;
+        const fileResponse = await fetch(fileInfoUrl, {
+          headers: {
+            'Authorization': `Bearer ${MAIN_INSTANCE.token}`,
+          }
+        });
         
         if (fileResponse.ok) {
           const fileData = await fileResponse.json();
@@ -340,16 +344,25 @@ app.get('/api/videos', async (req, res): Promise<any> => {
   }
 
   try {
-    // Fetch videos from main instance
-    console.log(`[VIDEOS] Fetching from main instance: ${MAIN_INSTANCE.url}/api/files`);
-    const mainResponse = await fetch(`${MAIN_INSTANCE.url}/api/files`, {
+    // Check if token is configured
+    if (!MAIN_INSTANCE.token) {
+      console.error('[VIDEOS] MAIN_INSTANCE_TOKEN not configured');
+      return res.status(500).json({ error: 'Main instance token not configured' });
+    }
+
+    // Fetch videos from main instance using PUBLIC API with token auth
+    console.log(`[VIDEOS] Fetching from main instance: ${MAIN_INSTANCE.url}/api/public/files`);
+    const mainResponse = await fetch(`${MAIN_INSTANCE.url}/api/public/files`, {
       headers: {
-        'Authorization': `Bearer ${process.env.MAIN_INSTANCE_AUTH_TOKEN || 'default-token'}`,
+        'Authorization': `Bearer ${MAIN_INSTANCE.token}`,
       }
     });
 
     if (!mainResponse.ok) {
       console.error(`[VIDEOS] Failed to fetch from main instance: ${mainResponse.status}`);
+      if (mainResponse.status === 401) {
+        return res.status(500).json({ error: 'Main instance token invalid or expired' });
+      }
       return res.status(500).json({ error: 'Failed to fetch videos from main instance' });
     }
 
@@ -369,13 +382,20 @@ app.get('/api/videos', async (req, res): Promise<any> => {
       fileSize: file.size,
       processedAt: file.created_at,
       type: 'mp4',
-      playUrl: `${MAIN_INSTANCE.url}/api/file/${file.hash}`, // Will fetch signed URL when needed
+      playUrl: `${MAIN_INSTANCE.url}/api/public/file/${file.hash}`, // Will fetch signed URL when needed
     }));
 
     // Enhance with signed URLs from main instance
     const videoListWithUrls = await Promise.all(videoList.map(async (video: any) => {
       try {
-        const fileResponse = await fetch(`${MAIN_INSTANCE.url}/api/file/${video.hash}`);
+        const fileResponse = await fetch(
+          `${MAIN_INSTANCE.url}/api/public/file/${video.hash}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${MAIN_INSTANCE.token}`,
+            }
+          }
+        );
         if (fileResponse.ok) {
           const fileData = await fileResponse.json();
           video.playUrl = fileData.download?.url;

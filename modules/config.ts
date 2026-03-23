@@ -29,7 +29,8 @@ export const BROWSER_ARGS = [
 // --- Main Instance Configuration (Upload destination) ---
 export const MAIN_INSTANCE = {
     url: requireEnv('MAIN_INSTANCE_URL'),  // e.g., http://localhost:3000
-    apiKey: process.env.MAIN_INSTANCE_API_KEY || 'default-api-key',  // Optional: for auth if needed
+    apiKey: process.env.MAIN_INSTANCE_API_KEY || 'default-api-key',  // For upload auth
+    token: requireEnv('MAIN_INSTANCE_TOKEN'),  // API token for public file access (Bearer auth)
 };
 
 // --- MongoDB Configuration (Local storage for scraper metadata) ---
