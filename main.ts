@@ -426,6 +426,102 @@ app.get('/api/videos', async (req, res): Promise<any> => {
   }
 });
 
+// ── Signed URL proxy (for gallery to fetch signed URLs) ───────────────────
+app.get('/api/signed-url/:hash', async (req, res): Promise<any> => {
+  const authHeader = req.headers['authorization'];
+  if (authHeader !== process.env.DASHBOARD_PIN) {
+    return res.status(403).json({ error: 'Unauthorized access' });
+  }
+
+  const { hash } = req.params;
+
+  try {
+    // Check if token is configured
+    if (!MAIN_INSTANCE.token) {
+      console.error('[SIGNED-URL] MAIN_INSTANCE_TOKEN not configured');
+      return res.status(500).json({ error: 'Main instance token not configured' });
+    }
+
+    // Fetch signed URL from main instance using Bearer token
+    console.log(`[SIGNED-URL] Fetching signed URL for ${hash.substring(0, 8)}...`);
+    const fileResponse = await fetch(
+      `${MAIN_INSTANCE.url}/api/public/file/${hash}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${MAIN_INSTANCE.token}`,
+        }
+      }
+    );
+
+    if (!fileResponse.ok) {
+      console.error(`[SIGNED-URL] Failed to fetch from main instance: ${fileResponse.status}`);
+      if (fileResponse.status === 401) {
+        return res.status(401).json({ error: 'Main instance token invalid or expired' });
+      }
+      return res.status(500).json({ error: 'Failed to fetch signed URL from main instance' });
+    }
+
+    const fileData = await fileResponse.json();
+    
+    if (fileData.download?.url) {
+      console.log(`[SIGNED-URL] ✓ Got signed URL for ${hash.substring(0, 8)}...`);
+      return res.json(fileData);
+    } else {
+      console.warn(`[SIGNED-URL] No signed URL in response for ${hash.substring(0, 8)}...`);
+      return res.json(fileData);  // Return as-is, might have data but no download URL
+    }
+
+  } catch (error: any) {
+    console.error(`[SIGNED-URL] Error: ${error.message}`);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// ── Proxy endpoint for gallery to fetch signed URLs ──────────────────────────
+// Gallery uses this to fetch signed URLs with PIN auth (instead of Bearer token)
+app.get('/api/signed-url/:hash', async (req, res): Promise<any> => {
+  const authHeader = req.headers['authorization'];
+  if (authHeader !== process.env.DASHBOARD_PIN) {
+    return res.status(403).json({ error: 'Missing or invalid authorization header' });
+  }
+
+  const { hash } = req.params;
+
+  try {
+    if (!MAIN_INSTANCE.token) {
+      console.error('[SIGNED-URL] MAIN_INSTANCE_TOKEN not configured');
+      return res.status(500).json({ error: 'Main instance token not configured' });
+    }
+
+    // ✅ Scraper uses Bearer token to fetch from main instance
+    const fileResponse = await fetch(
+      `${MAIN_INSTANCE.url}/api/public/file/${hash}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${MAIN_INSTANCE.token}`,
+        }
+      }
+    );
+
+    if (!fileResponse.ok) {
+      console.warn(`[SIGNED-URL] Failed for ${hash}: ${fileResponse.status}`);
+      return res.status(fileResponse.status).json({ error: 'Failed to fetch file from main instance' });
+    }
+
+    const fileData = await fileResponse.json();
+    
+    if (fileData.download?.url) {
+      console.log(`[SIGNED-URL] ✓ Got signed URL for ${hash.substring(0, 8)}...`);
+      return res.json({ download: fileData.download });
+    } else {
+      return res.status(404).json({ error: 'No signed URL available yet' });
+    }
+  } catch (error: any) {
+    console.error(`[SIGNED-URL] Error: ${error.message}`);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Static ─────────────────────────────────────────────────────────────────
 app.get('/gallery', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));

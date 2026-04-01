@@ -156,21 +156,28 @@
                     if (source.dataset.src) {
                         let videoUrl = source.dataset.src;
                         
-                        // If it's an API endpoint (not a signed URL), fetch the signed URL
+                        // If it's an API endpoint (not a signed URL), fetch the signed URL via proxy
                         if (videoUrl.includes('/api/public/file/')) {
                             try {
                                 const pin = localStorage.getItem('vault_pin');
-                                const response = await fetch(videoUrl, {
-                                    headers: { 'Authorization': pin }
-                                });
-                                if (response.ok) {
-                                    const data = await response.json();
-                                    if (data.download?.url) {
-                                        videoUrl = data.download.url;
-                                        console.log(`[Gallery] ✓ Fetched signed URL`);
+                                const hashMatch = videoUrl.match(/\/api\/public\/file\/([a-f0-9]+)$/);
+                                
+                                if (hashMatch) {
+                                    const hash = hashMatch[1];
+                                    // ✅ Use proxy endpoint with PIN auth (not Bearer token)
+                                    const response = await fetch(`/api/signed-url/${hash}`, {
+                                        headers: { 'Authorization': pin }
+                                    });
+                                    
+                                    if (response.ok) {
+                                        const data = await response.json();
+                                        if (data.download?.url) {
+                                            videoUrl = data.download.url;
+                                            console.log(`[Gallery] ✓ Got signed URL via proxy for ${hash.substring(0, 8)}...`);
+                                        }
+                                    } else {
+                                        console.warn(`[Gallery] Failed to fetch signed URL (${response.status}) for ${hash.substring(0, 8)}...`);
                                     }
-                                } else {
-                                    console.warn(`[Gallery] Failed to fetch signed URL: ${response.status}`);
                                 }
                             } catch (e) {
                                 console.error(`[Gallery] Error fetching signed URL:`, e);
