@@ -146,55 +146,17 @@
         }
 
         // ── Lazy loading ───────────────────────────────────────────────────
-        const videoObserver = new IntersectionObserver((entries) => {
-            entries.forEach(async entry => {
-                if (entry.isIntersecting) {
-                    const card = entry.target;
-                    const video = card.querySelector('video');
-                    const source = video.querySelector('source');
-                    
-                    if (source.dataset.src) {
-                        let videoUrl = source.dataset.src;
-                        
-                        // If it's an API endpoint (not a signed URL), fetch the signed URL via proxy
-                        if (videoUrl.includes('/api/public/file/')) {
-                            try {
-                                const pin = localStorage.getItem('vault_pin');
-                                const hashMatch = videoUrl.match(/\/api\/public\/file\/([a-f0-9]+)$/);
-                                
-                                if (hashMatch) {
-                                    const hash = hashMatch[1];
-                                    // ✅ Use proxy endpoint with PIN auth (not Bearer token)
-                                    const response = await fetch(`/api/signed-url/${hash}`, {
-                                        headers: { 'Authorization': pin }
-                                    });
-                                    
-                                    if (response.ok) {
-                                        const data = await response.json();
-                                        if (data.download?.url) {
-                                            videoUrl = data.download.url;
-                                            console.log(`[Gallery] ✓ Got signed URL via proxy for ${hash.substring(0, 8)}...`);
-                                        }
-                                    } else {
-                                        console.warn(`[Gallery] Failed to fetch signed URL (${response.status}) for ${hash.substring(0, 8)}...`);
-                                    }
-                                }
-                            } catch (e) {
-                                console.error(`[Gallery] Error fetching signed URL:`, e);
-                            }
-                        }
-                        
-                        source.src = videoUrl;
-                        video.load();
-                        source.removeAttribute('data-src');
-                    }
-                    card.classList.add('loaded');
-                } else {
-                    const video = entry.target.querySelector('video');
-                    if (video) video.pause();
-                }
-            });
-        }, { threshold: 0.1 });
+      // ── Lazy loading (Animation Only) ──────────────────────────────────────────
+const videoObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+        if (entry.isIntersecting) {
+            entry.target.classList.add('loaded');
+        } else {
+            const video = entry.target.querySelector('video');
+            if (video && !video.paused) video.pause();
+        }
+    });
+}, { threshold: 0.1 });
 
         // ── Helpers ────────────────────────────────────────────────────────
         function formatSize(bytes) {
@@ -258,6 +220,7 @@
         }
 
         // ── Render ─────────────────────────────────────────────────────────
+       // ── Render ─────────────────────────────────────────────────────────
         function renderGrid(videos) {
             const grid = document.getElementById('video-grid');
             const statsBar     = document.getElementById('stats-bar');
@@ -292,9 +255,19 @@
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                         </svg>
                     </button>
-                    <video controls class="w-full aspect-video bg-black" preload="none">
-                        <source data-src="${video.playUrl}" type="video/mp4">
-                    </video>
+                    
+                    <div class="relative w-full aspect-video bg-black flex items-center justify-center">
+                        <video controls class="w-full h-full hidden" preload="none"></video>
+                        <div class="absolute inset-0 flex items-center justify-center cursor-pointer hover:bg-white/10 transition group/play"
+                             onclick="loadSingleVideo(this, '${video.playUrl}')">
+                            <div class="bg-indigo-600/80 group-hover/play:bg-indigo-500 text-white rounded-full p-4 shadow-lg transition transform group-hover/play:scale-110">
+                                <svg class="w-8 h-8 ml-1" fill="currentColor" viewBox="0 0 20 20">
+                                    <path d="M4 4l12 6-12 6z"></path>
+                                </svg>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="p-4">
                         <h3 class="font-bold text-white truncate text-sm md:text-base mb-2" title="${video.title}">${video.title || 'Untitled'}</h3>
                         <div class="flex justify-between items-center text-[10px] uppercase tracking-wider text-gray-500">
@@ -343,7 +316,50 @@
                 grid.innerHTML = `<div class="col-span-full text-red-400 p-6 border border-red-900 bg-red-900/10 rounded-xl">Connection Error: ${error.message}</div>`;
             }
         }
+// ── On-Demand Video Loading ────────────────────────────────────────
+async function loadSingleVideo(overlayElement, videoUrl) {
+    const container = overlayElement.parentElement;
+    const videoElement = container.querySelector('video');
 
+    // Show a loading spinner on the overlay
+    overlayElement.innerHTML = '<div class="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500"></div>';
+
+    try {
+        let finalUrl = videoUrl;
+        
+        // Fetch signed URL if needed
+        if (videoUrl.includes('/api/public/file/')) {
+            const pin = localStorage.getItem('vault_pin');
+            const hashMatch = videoUrl.match(/\/api\/public\/file\/([a-f0-9]+)$/);
+            
+            if (hashMatch) {
+                const hash = hashMatch[1];
+                const response = await fetch(`/api/signed-url/${hash}`, {
+                    headers: { 'Authorization': pin }
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.download?.url) {
+                        finalUrl = data.download.url;
+                    }
+                } else {
+                    throw new Error("Failed to authenticate URL");
+                }
+            }
+        }
+
+        // Set the video source, reveal the player, hide the overlay, and play
+        videoElement.src = finalUrl;
+        videoElement.classList.remove('hidden');
+        overlayElement.remove(); // Delete the overlay entirely
+        videoElement.play();
+
+    } catch (e) {
+        console.error(`[Gallery] Error loading video:`, e);
+        overlayElement.innerHTML = '<span class="text-red-500 font-bold text-sm bg-gray-900 p-2 rounded">Failed to load</span>';
+    }
+}
         // ── Init ───────────────────────────────────────────────────────────
         window.addEventListener('DOMContentLoaded', () => {
             if (localStorage.getItem('vault_pin')) {
