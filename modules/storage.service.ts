@@ -5,6 +5,7 @@
 import { MongoClient, Db } from "mongodb";
 import crypto from "crypto";
 import { spawn } from "child_process";
+import fs from "fs";
 import { MAIN_INSTANCE, MONGO_URI, MONGO_DB } from "./config.js";
 
 let db: Db;
@@ -227,17 +228,17 @@ function spawnFFmpeg(args: string[]): { process: any; promise: Promise<void> } {
 
 // ============ UPLOAD TO MAIN INSTANCE ============
 async function uploadToMainInstance(
-  fileBuffer: Buffer,
+  filePath: string,
   fileName: string,
   title: string,
-  hash: string
+  hash: string,
+  fileSizeBytes: number
 ): Promise<{ success: boolean; hash?: string; isDuplicate?: boolean; error?: string }> {
   try {
     const formData = new FormData();
 
-    // Append file as Blob
-    const uint8Array = new Uint8Array(fileBuffer);
-    const blob = new Blob([uint8Array], { type: 'video/mp4' });
+    // Append file as Blob from disk (avoids OOM crash)
+    const blob = await fs.openAsBlob(filePath);
 
     // Append metadata
     formData.append('hash', hash);
@@ -246,7 +247,7 @@ async function uploadToMainInstance(
     console.log(`[MAIN-UPLOAD] 📤 Uploading to main instance: ${MAIN_INSTANCE.url}/api/upload`);
     console.log(`[MAIN-UPLOAD]    File: ${fileName}`);
     console.log(`[MAIN-UPLOAD]    Title: ${title}`);
-    console.log(`[MAIN-UPLOAD]    Size: ${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`[MAIN-UPLOAD]    Size: ${(fileSizeBytes / 1024 / 1024).toFixed(2)} MB`);
 
     const uploadUrl = `${MAIN_INSTANCE.url}/api/upload`;
     const response = await fetch(uploadUrl, {
@@ -342,7 +343,10 @@ export async function processAndStoreVideo(
 
     let bytesReceived = 0;
     let ffmpegError: Error | null = null;
-    let chunks: Buffer[] = [];
+    
+    // Write directly to a temporary file on disk instead of memory array
+    const tempFilePath = `/tmp/${jobId}_${Date.now()}.mp4`;
+    const fileStream = fs.createWriteStream(tempFilePath);
 
     const { process: ffmpeg, promise: ffmpegPromise } = spawnFFmpeg(ffmpegArgs);
     ffmpegProc = ffmpeg;
@@ -358,10 +362,9 @@ export async function processAndStoreVideo(
       if (text.includes('Error')) console.error(`[FFMPEG:${jobId}]: ${text.trim()}`);
     });
 
-    // Collect all chunks into an array instead of concatenating instantly (avoids O(N^2) memory crash)
     ffmpeg.stdout!.on('data', (chunk: Buffer) => {
       hash.update(chunk);
-      chunks.push(chunk);
+      fileStream.write(chunk);
       bytesReceived += chunk.length;
     });
 
@@ -373,15 +376,20 @@ export async function processAndStoreVideo(
     await Promise.allSettled([ffmpegPromise]);
 
     clearTimeout(ffmpegTimeoutHandle);
+    
+    // Close the file stream properly and wait for finish
+    fileStream.end();
+    await new Promise<void>((resolve) => fileStream.on('finish', () => resolve()));
 
-    if (ffmpegError) throw ffmpegError;
+    if (ffmpegError) {
+      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+      throw ffmpegError;
+    }
+    
     if (bytesReceived === 0) {
+      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
       return { success: false, error: 'No video data' };
     }
-
-    // Concatenate all buffers exactly once at the end
-    const fileBuffer = Buffer.concat(chunks);
-    chunks = []; // free array from memory
 
     const finalHash = hash.digest('hex');
 
@@ -389,13 +397,20 @@ export async function processAndStoreVideo(
       onProgress({ stage: 'uploading', percent: 75, bytesProcessed: bytesReceived }).catch(() => { });
     }
 
-    // Upload to main instance
-    const uploadResult = await uploadToMainInstance(
-      fileBuffer,
-      `${finalHash}.mp4`,
-      title,
-      finalHash
-    );
+    // Upload to main instance via disk stream Blob
+    let uploadResult;
+    try {
+      uploadResult = await uploadToMainInstance(
+        tempFilePath,
+        `${finalHash}.mp4`,
+        title,
+        finalHash,
+        bytesReceived
+      );
+    } finally {
+      // Always cleanup the temp file!
+      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+    }
 
     if (!uploadResult.success) {
       return {
