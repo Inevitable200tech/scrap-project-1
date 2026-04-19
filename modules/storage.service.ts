@@ -163,11 +163,21 @@ function buildHeaders(referer: string, origin: string): string {
 
 // FFmpeg args for INSTANT method
 function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean): string[] {
-  // COPY MODE: Direct copy (H.264 MP4)
+  // Base optimizations to skip the 10-second probing delay and handle flaky servers
+  const fastProbeArgs = [
+    '-analyzeduration', '5000000',
+    '-probesize', '5000000',
+    '-reconnect', '1',
+    '-reconnect_streamed', '1',
+    '-reconnect_delay_max', '5'
+  ];
+
   if (isCopyMode) {
+    // Direct MP4 COPY MODE
     return [
       '-headers', headers,
       '-tls_verify', '0',
+      ...fastProbeArgs,
       '-i', videoUrl,
       '-c:v', 'copy',
       '-c:a', 'copy',
@@ -177,22 +187,16 @@ function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean)
     ];
   }
 
-  // ENCODE MODE: Fast MP4 encoding for HLS (libx264 ultrafast)
+  // HLS/M3U8 COPY MODE (Lightning fast compared to the old libx264 re-encoding)
   return [
     '-headers', headers,
     '-tls_verify', '0',
+    ...fastProbeArgs,
     '-i', videoUrl,
-    '-c:v', 'libx264',
-    '-preset', 'ultrafast',
-    '-crf', '32',                // Lower quality = faster
-    '-vf', 'scale=-2:320',       // 320p
-    '-r', '20',                  // 20fps
-    '-b:v', '500k',
-    '-c:a', 'aac',
-    '-b:a', '64k',
-    '-ac', '1',
+    '-c:v', 'copy',
+    '-c:a', 'copy',
+    '-bsf:a', 'aac_adtstoasc', // Fixes audio mapping when extracting AAC from MPEG-TS chunks
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-    '-progress', 'pipe:2',
     '-f', 'mp4',
     'pipe:1',
   ];
@@ -325,10 +329,10 @@ export async function processAndStoreVideo(
     if (!isM3U8) {
       // Try to detect if H.264 MP4 (can use copy)
       isCopyMode = true;  // Assume copy mode for direct MP4
-      modeLabel = 'COPY';
+      modeLabel = 'COPY (Direct)';
     } else {
-      // HLS requires encoding to MP4
-      modeLabel = 'ENCODE (HLS → MP4)';
+      // HLS now uses COPY mode too (lightning fast)
+      modeLabel = 'COPY (HLS → MP4)';
     }
 
     const ffmpegArgs = buildFFmpegArgs(headers, videoUrl, isCopyMode);
@@ -338,7 +342,7 @@ export async function processAndStoreVideo(
 
     let bytesReceived = 0;
     let ffmpegError: Error | null = null;
-    let fileBuffer = Buffer.alloc(0);
+    let chunks: Buffer[] = [];
 
     const { process: ffmpeg, promise: ffmpegPromise } = spawnFFmpeg(ffmpegArgs);
     ffmpegProc = ffmpeg;
@@ -354,10 +358,10 @@ export async function processAndStoreVideo(
       if (text.includes('Error')) console.error(`[FFMPEG:${jobId}]: ${text.trim()}`);
     });
 
-    // Collect all chunks into buffer for upload
+    // Collect all chunks into an array instead of concatenating instantly (avoids O(N^2) memory crash)
     ffmpeg.stdout!.on('data', (chunk: Buffer) => {
       hash.update(chunk);
-      fileBuffer = Buffer.concat([fileBuffer, chunk]);
+      chunks.push(chunk);
       bytesReceived += chunk.length;
     });
 
@@ -374,6 +378,10 @@ export async function processAndStoreVideo(
     if (bytesReceived === 0) {
       return { success: false, error: 'No video data' };
     }
+
+    // Concatenate all buffers exactly once at the end
+    const fileBuffer = Buffer.concat(chunks);
+    chunks = []; // free array from memory
 
     const finalHash = hash.digest('hex');
 
