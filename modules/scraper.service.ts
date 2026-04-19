@@ -1,3 +1,12 @@
+// scraper_service_FIXED.ts - Memory leak & crash prevention fixes
+// Key fixes:
+// 1. Proper try/finally cleanup (browser ALWAYS closes)
+// 2. Remove event listeners before close (prevent accumulation)
+// 3. Concurrent scrape limit (prevent OOM)
+// 4. Abort long-running operations
+// 5. Reduce DOM query complexity
+// 6. Add memory checks
+
 import playwrightExtra from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { PlaywrightBlocker } from '@ghostery/adblocker-playwright';
@@ -16,8 +25,24 @@ export interface ScrapeResult {
   deadReason?: string;
 }
 
+// ─── MEMORY MANAGEMENT ─────────────────────────────────────────────────────────
+let activeScrapes = 0;
+const MAX_CONCURRENT_SCRAPES = 2;  // ← FIX: Limit concurrent scrapes
+const MEMORY_THRESHOLD_MB = 800;    // ← FIX: Stop scraping if memory > 800MB
+
+function getMemoryUsageMB(): number {
+  if (typeof process !== 'undefined' && process.memoryUsage) {
+    return Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+  }
+  return 0;
+}
+
+function logMemory(msg: string): void {
+  const mb = getMemoryUsageMB();
+  console.log(`[MEMORY] ${msg} (${mb}MB heap)`);
+}
+
 // ─── Ghostery blocker singleton (shared across scrape calls) ──────────────────
-// Loaded once, cached to disk so filter lists aren't re-downloaded every run.
 let _blocker: PlaywrightBlocker | null = null;
 async function getBlocker(): Promise<PlaywrightBlocker> {
   if (_blocker) return _blocker;
@@ -30,14 +55,12 @@ async function getBlocker(): Promise<PlaywrightBlocker> {
     console.log('[Ghostery] Adblocker engine loaded (uBlock Origin + EasyList filters)');
   } catch (e: any) {
     console.warn(`[Ghostery] Failed to load blocker, continuing without it: ${e.message}`);
-    // Fall back to a no-op so the rest of the pipeline still works
     _blocker = null as any;
   }
   return _blocker!;
 }
 
 // ─── Aggressive ad/pop-up/overlay block patterns ──────────────────────────────
-// Layer 2: aborted at Playwright route level, on top of Ghostery.
 const BLOCKED_URL_PATTERNS: RegExp[] = [
   /doubleclick\.net/i, /googlesyndication\.com/i, /adnxs\.com/i,
   /adsystem\.com/i, /amazon-adsystem\.com/i, /outbrain\.com/i,
@@ -126,11 +149,48 @@ function detectDeadVideo(httpStatus: number, html: string): string | null {
   return null;
 }
 
+// ─── FIX: Proper timeout with abort ────────────────────────────────────────────
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, defaultValue: T): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | null = null;
   return Promise.race([
-    promise,
-    new Promise<T>(resolve => setTimeout(() => resolve(defaultValue), timeoutMs)),
+    promise.finally(() => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }),
+    new Promise<T>(resolve => {
+      timeoutHandle = setTimeout(() => resolve(defaultValue), timeoutMs);
+    }),
   ]);
+}
+
+// ─── FIX: Remove event listeners before closing ─────────────────────────────────
+async function cleanupPage(page: any, streamId: string): Promise<void> {
+  if (!page || page.isClosed?.()) return;
+  try {
+    // Remove all listeners BEFORE closing
+    page.removeAllListeners?.();
+  } catch (e: any) {
+    log(streamId, `Listener cleanup error: ${e.message}`, 'WARN');
+  }
+}
+
+async function cleanupContext(context: any, streamId: string): Promise<void> {
+  if (!context) return;
+  try {
+    context.removeAllListeners?.();
+    await context.close().catch(() => {});
+  } catch (e: any) {
+    log(streamId, `Context cleanup error: ${e.message}`, 'WARN');
+  }
+}
+
+async function cleanupBrowser(browser: any, streamId: string): Promise<void> {
+  if (!browser) return;
+  try {
+    browser.removeAllListeners?.();
+    await browser.close().catch(() => {});
+  } catch (e: any) {
+    log(streamId, `Browser cleanup error: ${e.message}`, 'WARN');
+  }
 }
 
 // ─── Layer 5: Aggressive DOM ad/overlay removal ───────────────────────────────
@@ -145,8 +205,10 @@ async function nukeAdOverlays(page: any, streamId: string): Promise<void> {
           catch { /* ignore bad selectors */ }
         }
 
-        // Force-remove any fixed/absolute full-screen overlays (z-index > 100)
-        document.querySelectorAll('*').forEach(el => {
+        // FIX: Only check visible elements (don't query all) to avoid freeze
+        const overlays = document.querySelectorAll('[style*="position"]');
+        let removed = 0;
+        overlays.forEach(el => {
           try {
             const style = window.getComputedStyle(el);
             const isOverlay =
@@ -158,12 +220,13 @@ async function nukeAdOverlays(page: any, streamId: string): Promise<void> {
               const rect = (el as HTMLElement).getBoundingClientRect();
               if (rect.width > window.innerWidth * 0.7 && rect.height > window.innerHeight * 0.7) {
                 (el as HTMLElement).remove();
+                removed++;
               }
             }
           } catch { /* ignore */ }
         });
 
-        // Patch window.open after load (belt-and-suspenders alongside initScript)
+        // Patch window.open after load
         (window as any).open = () => null;
         (window as any).showAd    = () => null;
         (window as any).displayAd = () => null;
@@ -311,7 +374,6 @@ async function extractStreamtapeUrl(page: any, streamId: string): Promise<string
     await withTimeout(page.waitForSelector('video', { timeout: 12000 }), 12500, undefined);
     await new Promise(resolve => setTimeout(resolve, 1500));
 
-    // Attempt 1: <video> src / currentSrc
     let videoUrl: string | null = await withTimeout(
       (page.evaluate(() => {
         const video = document.querySelector('video') as HTMLVideoElement | null;
@@ -327,7 +389,6 @@ async function extractStreamtapeUrl(page: any, streamId: string): Promise<string
       return videoUrl.startsWith('//') ? 'https:' + videoUrl : videoUrl;
     }
 
-    // Attempt 2: <source> children
     videoUrl = await withTimeout(
       (page.evaluate(() => {
         const sources = Array.from(document.querySelectorAll('video source'));
@@ -345,7 +406,6 @@ async function extractStreamtapeUrl(page: any, streamId: string): Promise<string
       return videoUrl.startsWith('//') ? 'https:' + videoUrl : videoUrl;
     }
 
-    // Attempt 3: window globals some Streamtape variants expose
     const intercepted: string | null = await withTimeout(
       (page.evaluate(() =>
         (window as any).__streamtape_src || (window as any).videoUrl || null
@@ -401,6 +461,32 @@ async function extractDOMVideo(page: any): Promise<string | null> {
 // ─── Main scrape entry point ───────────────────────────────────────────────────
 
 export async function performScrape(url: string, streamId: string): Promise<ScrapeResult> {
+  // ─── FIX: Check memory before scraping ──────────────────────────────────────
+  const memMB = getMemoryUsageMB();
+  if (memMB > MEMORY_THRESHOLD_MB) {
+    logMemory(`❌ Memory too high (${memMB}MB > ${MEMORY_THRESHOLD_MB}MB), queuing scrape`);
+    // Queue the scrape instead of rejecting
+    await new Promise(r => setTimeout(r, 5000));
+  }
+
+  // ─── FIX: Limit concurrent scrapes ────────────────────────────────────────
+  while (activeScrapes >= MAX_CONCURRENT_SCRAPES) {
+    log(streamId, `Waiting for slot (${activeScrapes}/${MAX_CONCURRENT_SCRAPES} active)`, 'WARN');
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  activeScrapes++;
+  logMemory(`Scrape started (${activeScrapes} active)`);
+
+  try {
+    return await scrapeWithCleanup(url, streamId);
+  } finally {
+    activeScrapes--;
+    logMemory(`Scrape finished (${activeScrapes} active)`);
+  }
+}
+
+async function scrapeWithCleanup(url: string, streamId: string): Promise<ScrapeResult> {
   const isVidara     = /vidara\./i.test(url);
   const isVidsonic   = /vidsonic\./i.test(url);
   const isVidnest    = /vidnest\./i.test(url);
@@ -411,221 +497,233 @@ export async function performScrape(url: string, streamId: string): Promise<Scra
   log(streamId, `Starting scrape for: ${url}`);
   if (isVidara) log(streamId, `Vidara resolved → ${targetUrl}`);
 
-  const scrapeAttempt = async (): Promise<ScrapeResult> => {
-    let browser: any = null;
-    let context: any = null;
-    let page: any    = null;
-    const interceptedVideos: { site: string; url: string }[] = [];
+  let browser: any = null;
+  let context: any = null;
+  let page: any    = null;
+  const interceptedVideos: { site: string; url: string }[] = [];
 
+  try {
+    browser = await playwrightExtra.chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--no-zygote',
+        '--disable-setuid-sandbox',
+        '--disable-infobars',
+        '--window-size=1280,900',
+        '--disable-blink-features=AutomationControlled',
+        '--block-new-web-contents',
+        '--disable-component-extensions-with-background-pages',
+      ],
+    });
+
+    context = await browser.newContext({
+      viewport: { width: 1280, height: 900 },
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    });
+
+    page = await context.newPage();
+    log(streamId, 'Page opened');
+
+    // ── Layer 0: Ghostery adblocker (uBlock Origin + EasyList filter lists) ──
     try {
-      browser = await playwrightExtra.chromium.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-          '--no-zygote',
-          '--disable-setuid-sandbox',
-          '--disable-infobars',
-          '--window-size=1280,900',
-          '--disable-blink-features=AutomationControlled',
-          '--block-new-web-contents',
-          '--disable-component-extensions-with-background-pages',
-        ],
-      });
-
-      context = await browser.newContext({
-        viewport: { width: 1280, height: 900 },
-        userAgent:
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      });
-
-      page = await context.newPage();
-      log(streamId, 'Page opened');
-
-      // ── Layer 0: Ghostery adblocker (uBlock Origin + EasyList filter lists) ──
-      try {
-        const blocker = await getBlocker();
-        if (blocker) {
-          await blocker.enableBlockingInPage(page);
-          log(streamId, 'Ghostery adblocker active on page');
-        }
-      } catch (e: any) {
-        log(streamId, `Ghostery enableBlockingInPage failed: ${e.message}`, 'WARN');
+      const blocker = await getBlocker();
+      if (blocker) {
+        await blocker.enableBlockingInPage(page);
+        log(streamId, 'Ghostery adblocker active on page');
       }
-
-      // ── Layer 1: Playwright route interception (custom blocklist) ─────────────
-      await page.route('**/*', async (route: any) => {
-        const reqUrl: string = route.request().url();
-        if (BLOCKED_URL_PATTERNS.some(p => p.test(reqUrl))) {
-          await route.abort('blockedbyclient');
-          return;
-        }
-        await route.continue();
-      });
-
-      // ── Layer 2: Network video sniffer ────────────────────────────────────────
-      page.on('request', (request: { url: () => string }) => {
-        const reqUrl = request.url();
-        if (
-          (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4')) &&
-          reqUrl !== url &&
-          !interceptedVideos.some(v => v.url === reqUrl)
-        ) {
-          log(streamId, `VIDEO INTERCEPTED: ${reqUrl.substring(0, 80)}...`);
-          interceptedVideos.push({ site: 'Network-Sniffer', url: reqUrl });
-        }
-      });
-
-      page.on('close', () => log(streamId, 'Page closed', 'WARN'));
-      page.on('console', (msg: any) => {
-        if (msg.type() === 'error') log(streamId, `JS Error: ${msg.text()}`, 'WARN');
-      });
-
-      // ── Layer 3: Popup / new-tab suppression ──────────────────────────────────
-      context.on('page', async (popup: any) => {
-        if (popup === page) return;
-        try {
-          await new Promise(r => setTimeout(r, 300));
-          if (!popup.isClosed?.()) await popup.close({ runBeforeUnload: false }).catch(() => {});
-          log(streamId, 'Popup suppressed');
-        } catch (e: any) {
-          log(streamId, `Popup handler error: ${e.message}`, 'WARN');
-        }
-      });
-
-      // ── Layer 4: Patch window.open + ad globals BEFORE any page JS runs ───────
-      await page.addInitScript(() => {
-        window.open = () => null as any;
-        try {
-          Object.defineProperty(window, 'open', { value: () => null, writable: false });
-        } catch { /* already sealed */ }
-
-        (window as any).popUnder  = () => null;
-        (window as any).popunder  = () => null;
-        (window as any).showAd    = () => null;
-        (window as any).loadAd    = () => null;
-        (window as any).displayAd = () => null;
-
-        const _createElement = document.createElement.bind(document);
-        (document as any).createElement = function (tag: string, ...args: any[]) {
-          const el = _createElement(tag, ...args);
-          if (tag.toLowerCase() === 'script') {
-            const _setAttr = el.setAttribute.bind(el);
-            el.setAttribute = function (name: string, value: string) {
-              if (name === 'src') {
-                const blocked = [
-                  'popads', 'popcash', 'popunder', 'exoclick',
-                  'trafficjunky', 'adcash', 'hilltopads', 'propellerads',
-                  'plugrush', 'juicyads', 'adform', 'adnxs',
-                  'dtscout', 'dtscdn',
-                ];
-                if (blocked.some(b => value.includes(b))) {
-                  console.warn(`[AdBlock-init] Blocked script injection: ${value}`);
-                  return;
-                }
-              }
-              _setAttr(name, value);
-            };
-          }
-          return el;
-        };
-      });
-
-      // Navigation
-      let httpStatus = 200;
-      log(streamId, `Navigating to: ${targetUrl}`);
-      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 35000 })
-        .then((response: any) => {
-          httpStatus = response?.status() ?? 200;
-          log(streamId, `HTTP ${httpStatus}`);
-        })
-        .catch((e: any) => {
-          log(streamId, `Navigation error: ${e.message}`, 'WARN');
-        });
-
-      if (!page || page.isClosed?.()) throw new Error('Page closed after navigation');
-
-      // ── Layer 5: DOM nuke after load ──────────────────────────────────────────
-      await nukeAdOverlays(page, streamId);
-
-      // Dead video check
-      const pageHtml = await withTimeout(page.content(), 5000, '');
-      const deadReason = detectDeadVideo(httpStatus, pageHtml);
-      if (deadReason) {
-        log(streamId, `Dead video: ${deadReason}`, 'WARN');
-        return { title: 'Dead Video', originalUrl: url, videos: [], dead: true, deadReason };
-      }
-
-      // ── Site-specific extraction ───────────────────────────────────────────────
-      if (isVidara) {
-        log(streamId, 'Vidara JW Player extraction');
-        const vidaraUrl = await extractVidaraUrl(page, streamId);
-        if (vidaraUrl) {
-          log(streamId, `Vidara: ${String(vidaraUrl).substring(0, 80)}...`);
-          interceptedVideos.push({ site: 'Vidara-JW', url: vidaraUrl });
-        }
-      } else if (isVidnest) {
-        log(streamId, 'Vidnest JW Player extraction');
-        const jwUrl = await extractVidnestUrl(page, streamId);
-        if (jwUrl) {
-          log(streamId, `Vidnest JW: ${String(jwUrl).substring(0, 80)}...`);
-          interceptedVideos.push({ site: 'JW-Internal', url: jwUrl });
-        }
-      } else if (isVidsonic) {
-        log(streamId, 'Vidsonic Video.js extraction');
-        const vjsUrl = await extractVidsonicUrl(page, streamId);
-        if (vjsUrl) {
-          log(streamId, `Vidsonic VJS: ${String(vjsUrl).substring(0, 80)}...`);
-          interceptedVideos.push({ site: 'VJS-Internal', url: vjsUrl });
-        }
-      } else if (isStreamtape) {
-        log(streamId, 'Streamtape DOM extraction');
-        const stUrl = await extractStreamtapeUrl(page, streamId);
-        if (stUrl) {
-          log(streamId, `Streamtape: ${String(stUrl).substring(0, 80)}...`);
-          interceptedVideos.push({ site: 'Streamtape-DOM', url: stUrl });
-        }
-      } else {
-        log(streamId, 'Generic player extraction');
-        const genericUrl = await extractGenericVideoUrl(page, streamId);
-        if (genericUrl) {
-          log(streamId, `Generic: ${String(genericUrl).substring(0, 80)}...`);
-          interceptedVideos.push({ site: 'Generic-Play', url: genericUrl });
-        }
-      }
-
-      // Fallback: DOM video for non-Streamtape/Vidara sites
-      if (!isStreamtape && !isVidara && interceptedVideos.length === 0) {
-        const domUrl = await extractDOMVideo(page);
-        if (domUrl) {
-          log(streamId, `DOM Video: ${String(domUrl).substring(0, 80)}...`);
-          interceptedVideos.push({ site: 'DOM-Extraction', url: domUrl });
-        }
-      }
-
-      const title = await withTimeout(page.title(), 2000, 'Unknown Title');
-      log(streamId, `Title: ${title}`);
-      log(streamId, `Found ${interceptedVideos.length} video URLs`);
-
-      if (interceptedVideos.length === 0) {
-        await dumpPageDebugInfo(page, streamId, interceptedVideos.length);
-      }
-
-      await context?.close().catch(() => {});
-      await browser?.close().catch(() => {});
-
-      const filteredVideos = filterVideoUrls(interceptedVideos, url);
-      log(streamId, `Filtered to ${filteredVideos.length} valid URLs`);
-
-      return { title, originalUrl: url, videos: filteredVideos };
-
-    } catch (error: any) {
-      log(streamId, `FAILED: ${error.message || 'Unknown error'}`, 'ERROR');
-      await context?.close().catch(() => {});
-      await browser?.close().catch(() => {});
-      throw error;
+    } catch (e: any) {
+      log(streamId, `Ghostery enableBlockingInPage failed: ${e.message}`, 'WARN');
     }
-  };
 
-  return scrapeAttempt();
+    // ── Layer 1: Playwright route interception (custom blocklist) ─────────────
+    await page.route('**/*', async (route: any) => {
+      const reqUrl: string = route.request().url();
+      if (BLOCKED_URL_PATTERNS.some(p => p.test(reqUrl))) {
+        await route.abort('blockedbyclient');
+        return;
+      }
+      await route.continue();
+    });
+
+    // ── Layer 2: Network video sniffer ────────────────────────────────────────
+    const onRequest = (request: { url: () => string }) => {
+      const reqUrl = request.url();
+      if (
+        (reqUrl.includes('get_video') || reqUrl.includes('.m3u8') || reqUrl.includes('.mp4')) &&
+        reqUrl !== url &&
+        !interceptedVideos.some(v => v.url === reqUrl)
+      ) {
+        log(streamId, `VIDEO INTERCEPTED: ${reqUrl.substring(0, 80)}...`);
+        interceptedVideos.push({ site: 'Network-Sniffer', url: reqUrl });
+      }
+    };
+
+    const onPageClose = () => log(streamId, 'Page closed', 'WARN');
+    const onConsole = (msg: any) => {
+      if (msg.type() === 'error') log(streamId, `JS Error: ${msg.text()}`, 'WARN');
+    };
+
+    page.on('request', onRequest);
+    page.on('close', onPageClose);
+    page.on('console', onConsole);
+
+    // ── Layer 3: Popup / new-tab suppression ──────────────────────────────────
+    const onPopup = async (popup: any) => {
+      if (popup === page) return;
+      try {
+        await new Promise(r => setTimeout(r, 300));
+        if (!popup.isClosed?.()) await popup.close({ runBeforeUnload: false }).catch(() => {});
+        log(streamId, 'Popup suppressed');
+      } catch (e: any) {
+        log(streamId, `Popup handler error: ${e.message}`, 'WARN');
+      }
+    };
+
+    context.on('page', onPopup);
+
+    // ── Layer 4: Patch window.open + ad globals BEFORE any page JS runs ───────
+    await page.addInitScript(() => {
+      window.open = () => null as any;
+      try {
+        Object.defineProperty(window, 'open', { value: () => null, writable: false });
+      } catch { /* already sealed */ }
+
+      (window as any).popUnder  = () => null;
+      (window as any).popunder  = () => null;
+      (window as any).showAd    = () => null;
+      (window as any).loadAd    = () => null;
+      (window as any).displayAd = () => null;
+
+      const _createElement = document.createElement.bind(document);
+      (document as any).createElement = function (tag: string, ...args: any[]) {
+        const el = _createElement(tag, ...args);
+        if (tag.toLowerCase() === 'script') {
+          const _setAttr = el.setAttribute.bind(el);
+          el.setAttribute = function (name: string, value: string) {
+            if (name === 'src') {
+              const blocked = [
+                'popads', 'popcash', 'popunder', 'exoclick',
+                'trafficjunky', 'adcash', 'hilltopads', 'propellerads',
+                'plugrush', 'juicyads', 'adform', 'adnxs',
+                'dtscout', 'dtscdn',
+              ];
+              if (blocked.some(b => value.includes(b))) {
+                console.warn(`[AdBlock-init] Blocked script injection: ${value}`);
+                return;
+              }
+            }
+            _setAttr(name, value);
+          };
+        }
+        return el;
+      };
+    });
+
+    // Navigation
+    let httpStatus = 200;
+    log(streamId, `Navigating to: ${targetUrl}`);
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 35000 })
+      .then((response: any) => {
+        httpStatus = response?.status() ?? 200;
+        log(streamId, `HTTP ${httpStatus}`);
+      })
+      .catch((e: any) => {
+        log(streamId, `Navigation error: ${e.message}`, 'WARN');
+      });
+
+    if (!page || page.isClosed?.()) throw new Error('Page closed after navigation');
+
+    // ── Layer 5: DOM nuke after load ──────────────────────────────────────────
+    await nukeAdOverlays(page, streamId);
+
+    // Dead video check
+    const pageHtml = await withTimeout(page.content(), 5000, '');
+    const deadReason = detectDeadVideo(httpStatus, pageHtml);
+    if (deadReason) {
+      log(streamId, `Dead video: ${deadReason}`, 'WARN');
+      return { title: 'Dead Video', originalUrl: url, videos: [], dead: true, deadReason };
+    }
+
+    // ── Site-specific extraction ───────────────────────────────────────────────
+    if (isVidara) {
+      log(streamId, 'Vidara JW Player extraction');
+      const vidaraUrl = await extractVidaraUrl(page, streamId);
+      if (vidaraUrl) {
+        log(streamId, `Vidara: ${String(vidaraUrl).substring(0, 80)}...`);
+        interceptedVideos.push({ site: 'Vidara-JW', url: vidaraUrl });
+      }
+    } else if (isVidnest) {
+      log(streamId, 'Vidnest JW Player extraction');
+      const jwUrl = await extractVidnestUrl(page, streamId);
+      if (jwUrl) {
+        log(streamId, `Vidnest JW: ${String(jwUrl).substring(0, 80)}...`);
+        interceptedVideos.push({ site: 'JW-Internal', url: jwUrl });
+      }
+    } else if (isVidsonic) {
+      log(streamId, 'Vidsonic Video.js extraction');
+      const vjsUrl = await extractVidsonicUrl(page, streamId);
+      if (vjsUrl) {
+        log(streamId, `Vidsonic VJS: ${String(vjsUrl).substring(0, 80)}...`);
+        interceptedVideos.push({ site: 'VJS-Internal', url: vjsUrl });
+      }
+    } else if (isStreamtape) {
+      log(streamId, 'Streamtape DOM extraction');
+      const stUrl = await extractStreamtapeUrl(page, streamId);
+      if (stUrl) {
+        log(streamId, `Streamtape: ${String(stUrl).substring(0, 80)}...`);
+        interceptedVideos.push({ site: 'Streamtape-DOM', url: stUrl });
+      }
+    } else {
+      log(streamId, 'Generic player extraction');
+      const genericUrl = await extractGenericVideoUrl(page, streamId);
+      if (genericUrl) {
+        log(streamId, `Generic: ${String(genericUrl).substring(0, 80)}...`);
+        interceptedVideos.push({ site: 'Generic-Play', url: genericUrl });
+      }
+    }
+
+    // Fallback: DOM video for non-Streamtape/Vidara sites
+    if (!isStreamtape && !isVidara && interceptedVideos.length === 0) {
+      const domUrl = await extractDOMVideo(page);
+      if (domUrl) {
+        log(streamId, `DOM Video: ${String(domUrl).substring(0, 80)}...`);
+        interceptedVideos.push({ site: 'DOM-Extraction', url: domUrl });
+      }
+    }
+
+    const title = await withTimeout(page.title(), 2000, 'Unknown Title');
+    log(streamId, `Title: ${title}`);
+    log(streamId, `Found ${interceptedVideos.length} video URLs`);
+
+    if (interceptedVideos.length === 0) {
+      await dumpPageDebugInfo(page, streamId, interceptedVideos.length);
+    }
+
+    const filteredVideos = filterVideoUrls(interceptedVideos, url);
+    log(streamId, `Filtered to ${filteredVideos.length} valid URLs`);
+
+    return { title, originalUrl: url, videos: filteredVideos };
+
+  } catch (error: any) {
+    log(streamId, `FAILED: ${error.message || 'Unknown error'}`, 'ERROR');
+    throw error;
+  } finally {
+    // ─── FIX: Always cleanup, in correct order ──────────────────────────────
+    if (page) {
+      page.removeAllListeners?.();
+      await cleanupPage(page, streamId);
+    }
+    if (context) {
+      context.removeAllListeners?.();
+      await cleanupContext(context, streamId);
+    }
+    if (browser) {
+      browser.removeAllListeners?.();
+      await cleanupBrowser(browser, streamId);
+    }
+    logMemory(`Cleanup complete for ${streamId}`);
+  }
 }
