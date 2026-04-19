@@ -60,6 +60,33 @@ async function getBlocker(): Promise<PlaywrightBlocker> {
   return _blocker!;
 }
 
+let _browser: any = null;
+async function getGlobalBrowser() {
+  if (!_browser || !_browser.isConnected()) {
+    console.log('[BROWSER] Launching new persistent browser instance...');
+    _browser = await playwrightExtra.chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--no-zygote',
+        '--disable-setuid-sandbox',
+        '--disable-infobars',
+        '--window-size=1280,900',
+        '--disable-blink-features=AutomationControlled',
+        '--block-new-web-contents',
+        '--disable-component-extensions-with-background-pages',
+        '--js-flags="--max-old-space-size=128"'
+      ],
+    });
+  }
+  return _browser;
+}
+
+process.on('exit', () => {
+  if (_browser) _browser.close().catch(() => {});
+});
+
 // ─── Aggressive ad/pop-up/overlay block patterns ──────────────────────────────
 const BLOCKED_URL_PATTERNS: RegExp[] = [
   /doubleclick\.net/i, /googlesyndication\.com/i, /adnxs\.com/i,
@@ -497,27 +524,12 @@ async function scrapeWithCleanup(url: string, streamId: string): Promise<ScrapeR
   log(streamId, `Starting scrape for: ${url}`);
   if (isVidara) log(streamId, `Vidara resolved → ${targetUrl}`);
 
-  let browser: any = null;
+  const browser = await getGlobalBrowser();
   let context: any = null;
   let page: any    = null;
   const interceptedVideos: { site: string; url: string }[] = [];
 
   try {
-    browser = await playwrightExtra.chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--no-zygote',
-        '--disable-setuid-sandbox',
-        '--disable-infobars',
-        '--window-size=1280,900',
-        '--disable-blink-features=AutomationControlled',
-        '--block-new-web-contents',
-        '--disable-component-extensions-with-background-pages',
-      ],
-    });
-
     context = await browser.newContext({
       viewport: { width: 1280, height: 900 },
       userAgent:
@@ -720,10 +732,7 @@ async function scrapeWithCleanup(url: string, streamId: string): Promise<ScrapeR
       context.removeAllListeners?.();
       await cleanupContext(context, streamId);
     }
-    if (browser) {
-      browser.removeAllListeners?.();
-      await cleanupBrowser(browser, streamId);
-    }
+    // Global browser is kept alive for reuse
     logMemory(`Cleanup complete for ${streamId}`);
   }
 }
