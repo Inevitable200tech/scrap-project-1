@@ -10,6 +10,7 @@ import {
   getJob,
   updateJob,
   listJobs,
+  recoverInterruptedJobs,
   JobFailureReason,
 } from './modules/storage.service.js';
 import { PORT, MAIN_INSTANCE } from './modules/config.js';
@@ -539,6 +540,14 @@ app.listen(PORT, '0.0.0.0', async () => {
   try {
     await getDb();
     console.log(`✅ Connected to MongoDB`);
+
+    const interrupted = await recoverInterruptedJobs();
+    if (interrupted.length > 0) {
+      console.log(`[QUEUE] Recovering ${interrupted.length} pending/interrupted jobs from database...`);
+      for (const job of interrupted) {
+        await enqueueJob(job.jobId);
+      }
+    }
   } catch (err) {
     console.error('FATAL: Could not initialize. Process exiting.');
     process.exit(1);
