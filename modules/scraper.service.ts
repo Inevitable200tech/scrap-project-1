@@ -204,7 +204,11 @@ async function cleanupContext(context: any, streamId: string): Promise<void> {
   if (!context) return;
   try {
     context.removeAllListeners?.();
-    await context.close().catch(() => {});
+    // Wrap context.close() in a timeout to prevent infinite hang if Playwright gets stuck
+    await Promise.race([
+      context.close().catch(() => {}),
+      new Promise(resolve => setTimeout(resolve, 2000))
+    ]);
   } catch (e: any) {
     log(streamId, `Context cleanup error: ${e.message}`, 'WARN');
   }
