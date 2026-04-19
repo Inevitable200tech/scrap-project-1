@@ -362,10 +362,25 @@ export async function processAndStoreVideo(
       if (text.includes('Error')) console.error(`[FFMPEG:${jobId}]: ${text.trim()}`);
     });
 
+    let lastLogTime = Date.now();
+    let lastLogBytes = 0;
+
     ffmpeg.stdout!.on('data', (chunk: Buffer) => {
+      if (bytesReceived === 0) {
+        console.log(`[STORAGE:${jobId}] FFmpeg started receiving data...`);
+      }
       hash.update(chunk);
       fileStream.write(chunk);
       bytesReceived += chunk.length;
+
+      const now = Date.now();
+      if (now - lastLogTime > 5000) {
+        const mb = (bytesReceived / 1024 / 1024).toFixed(2);
+        const speed = ((bytesReceived - lastLogBytes) / 1024 / 1024 / ((now - lastLogTime) / 1000)).toFixed(2);
+        console.log(`[STORAGE:${jobId}] Downloading... ${mb} MB (${speed} MB/s)`);
+        lastLogTime = now;
+        lastLogBytes = bytesReceived;
+      }
     });
 
     ffmpeg.stdout!.on('error', (err: any) => {
@@ -373,13 +388,29 @@ export async function processAndStoreVideo(
     });
 
     // Wait for FFmpeg to complete
-    await Promise.allSettled([ffmpegPromise]);
+    const [ffmpegResult] = await Promise.allSettled([ffmpegPromise]);
+    console.log(`[STORAGE:${jobId}] FFmpeg promise settled: ${ffmpegResult.status}`);
 
     clearTimeout(ffmpegTimeoutHandle);
     
     // Close the file stream properly and wait for finish
+    console.log(`[STORAGE:${jobId}] Ending file stream...`);
     fileStream.end();
-    await new Promise<void>((resolve) => fileStream.on('finish', () => resolve()));
+    await new Promise<void>((resolve, reject) => {
+      fileStream.on('finish', () => {
+        console.log(`[STORAGE:${jobId}] File stream finished.`);
+        resolve();
+      });
+      fileStream.on('error', (err) => {
+        console.error(`[STORAGE:${jobId}] File stream error: ${err.message}`);
+        reject(err);
+      });
+    });
+
+    console.log(`[STORAGE:${jobId}] Checking for errors...`);
+    if (ffmpegResult.status === 'rejected') {
+      ffmpegError = new Error(`FFmpeg exited with error: ${ffmpegResult.reason}`);
+    }
 
     if (ffmpegError) {
       if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
