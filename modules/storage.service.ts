@@ -182,6 +182,7 @@ function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean)
       '-i', videoUrl,
       '-c:v', 'copy',
       '-c:a', 'copy',
+      '-ignore_unknown',
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       '-f', 'mp4',
       'pipe:1',
@@ -197,6 +198,8 @@ function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean)
     '-c:v', 'copy',
     '-c:a', 'copy',
     '-bsf:a', 'aac_adtstoasc', // Fixes audio mapping when extracting AAC from MPEG-TS chunks
+    '-copyts',                // Preserve original timestamps (better for stream stability)
+    '-ignore_unknown',        // Ignore unknown streams instead of failing
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
     '-f', 'mp4',
     'pipe:1',
@@ -206,20 +209,44 @@ function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean)
 function spawnFFmpeg(args: string[]): { process: any; promise: Promise<void> } {
   const process = spawn('ffmpeg', args);
   let resolved = false;
+  const stderrLines: string[] = [];
 
   const promise = new Promise<void>((resolve, reject) => {
     process.stderr.on('data', (data: any) => {
       const msg = data.toString();
       if (msg.includes('Error')) console.error(`[FFMPEG]: ${msg.trim()}`);
+      
+      // Store last 10 lines of stderr for better error reporting
+      stderrLines.push(msg.trim());
+      if (stderrLines.length > 10) stderrLines.shift();
     });
     process.on('error', (err: any) => {
-      if (!resolved) { resolved = true; reject(new Error(`FFmpeg spawn: ${err.message}`)); }
+      if (!resolved) { 
+        resolved = true; 
+        reject(new Error(`FFmpeg spawn: ${err.message}`)); 
+      }
     });
     process.on('exit', (code: number | null) => {
-      if (!resolved) { resolved = true; if (code !== 0) reject(new Error(`FFmpeg code ${code}`)); else resolve(); }
+      if (!resolved) { 
+        resolved = true; 
+        if (code !== 0) {
+          const lastError = stderrLines.join('\n');
+          reject(new Error(`FFmpeg code ${code}${lastError ? ': ' + lastError : ''}`)); 
+        } else {
+          resolve(); 
+        }
+      }
     });
     process.on('close', (code: number | null) => {
-      if (!resolved) { resolved = true; if (code !== 0) reject(new Error(`FFmpeg code ${code}`)); else resolve(); }
+      if (!resolved) { 
+        resolved = true; 
+        if (code !== 0) {
+          const lastError = stderrLines.join('\n');
+          reject(new Error(`FFmpeg code ${code}${lastError ? ': ' + lastError : ''}`)); 
+        } else {
+          resolve(); 
+        }
+      }
     });
   });
 

@@ -12,7 +12,9 @@ export const filterVideoUrls = (videos: any[], originalUrl: string) => {
     const isTracker = /yandex|mc\.ru|analytics|pixel|google|facebook|amazon|\.ts($|\?)/i.test(vUrl);
     const isLibraryAd = vUrl.includes('/library/') || vUrl.includes('/ads/');
 
-    return !isOriginal && !isBlob && !isAdDomain && !isTracker && !isLibraryAd;
+    const isImage = /\.(jpg|jpeg|png|gif|webp)($|\?)/i.test(vUrl) || vUrl.includes('.mp4.jpg') || vUrl.includes('.mp4.gif');
+
+    return !isOriginal && !isBlob && !isAdDomain && !isTracker && !isLibraryAd && !isImage;
   });
 
   // ── Step 2: Deduplicate by URL ────────────────────────────────────────────
@@ -45,6 +47,15 @@ export const filterVideoUrls = (videos: any[], originalUrl: string) => {
     const emergencyBackup = videos.find(v => !/google|analytics|yandex/i.test(v.url));
     return emergencyBackup ? [emergencyBackup] : [];
   }
+
+  // ── Step 6: Prioritize actual video formats ──────────────────────────────
+  uniqueVideos.sort((a, b) => {
+    const aIsVideo = /\.(mp4|m3u8)($|\?)/i.test(a.url);
+    const bIsVideo = /\.(mp4|m3u8)($|\?)/i.test(b.url);
+    if (aIsVideo && !bIsVideo) return -1;
+    if (!aIsVideo && bIsVideo) return 1;
+    return 0;
+  });
 
   return uniqueVideos;
 };
