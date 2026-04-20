@@ -524,6 +524,10 @@ app.get('/api/signed-url/:hash', async (req, res): Promise<any> => {
 });
 
 // ── Static ─────────────────────────────────────────────────────────────────
+app.get('/downloader', (req, res) => {
+  res.sendFile(path.join(__dirname, '../public/index.html'));
+});
+
 app.get('/gallery', (req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));
 });
@@ -534,7 +538,8 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
-  console.log(`🎥 Gallery: http://localhost:${PORT}/gallery`);
+  console.log(`🎥 Downloader: http://localhost:${PORT}/downloader`);
+  console.log(`🎥 Legacy UI: http://localhost:${PORT}/gallery`);
   console.log(`📡 Main Instance: ${MAIN_INSTANCE.url}`);
 
   try {

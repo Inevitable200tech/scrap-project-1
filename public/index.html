@@ -3,102 +3,146 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Video Vault</title>
+    <title>Video Vault | Downloader</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        .video-card { opacity: 0; transform: translateY(20px); transition: all 0.5s ease-out; }
-        .video-card.loaded { opacity: 1; transform: translateY(0); }
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+        .glass-panel {
+            background: rgba(17, 24, 39, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .animate-shimmer {
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent);
+            background-size: 200% 100%;
+            animation: shimmer 2s infinite;
+        }
+        @keyframes shimmer {
+            0% { background-position: -200% 0; }
+            100% { background-position: 200% 0; }
+        }
+        .progress-bar { transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1); }
+        .input-glow:focus {
+            box-shadow: 0 0 20px rgba(99, 102, 241, 0.2);
+            border-color: rgba(99, 102, 241, 0.5);
+        }
     </style>
 </head>
-<body class="bg-gray-900 text-gray-100 min-h-screen p-4 md:p-8 font-sans">
+<body class="bg-[#0b0f1a] text-gray-200 min-h-screen selection:bg-indigo-500/30">
 
-    <div id="lock-screen" class="fixed inset-0 bg-gray-950 z-50 flex items-center justify-center">
-        <div class="bg-gray-900 p-8 rounded-2xl border border-gray-800 shadow-2xl w-full max-w-md text-center">
-            <h2 class="text-3xl font-bold mb-6 text-white">🔐 Access Vault</h2>
-            <input type="password" id="admin-pin" placeholder="Enter PIN" autocomplete="off"
-                   class="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-3 mb-4 focus:outline-none focus:border-indigo-500 text-center text-xl tracking-widest text-white">
-            <button onclick="unlock()" class="w-full bg-indigo-600 hover:bg-indigo-500 py-3 rounded-lg font-bold transition">Unlock</button>
-            <p id="lock-error" class="text-red-500 mt-4 hidden text-sm"></p>
+    <!-- Auth Overlay -->
+    <div id="lock-screen" class="fixed inset-0 bg-[#0b0f1a] z-50 flex items-center justify-center p-4">
+        <div class="glass-panel p-8 rounded-3xl w-full max-w-md text-center shadow-2xl">
+            <div class="w-20 h-20 bg-indigo-600/20 rounded-2xl flex items-center justify-center mx-auto mb-6">
+                <svg class="w-10 h-10 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/>
+                </svg>
+            </div>
+            <h2 class="text-3xl font-bold mb-2 text-white">Access Vault</h2>
+            <p class="text-gray-400 mb-8 text-sm">Enter your secure PIN to continue</p>
+            <input type="password" id="admin-pin" placeholder="••••" autocomplete="off"
+                   class="w-full bg-gray-900/50 border border-gray-800 rounded-2xl px-4 py-4 mb-4 focus:outline-none input-glow text-center text-2xl tracking-[1em] text-white">
+            <button onclick="unlock()" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-bold transition-all transform active:scale-95 shadow-lg shadow-indigo-600/20">
+                Unlock System
+            </button>
+            <p id="lock-error" class="text-red-400 mt-4 hidden text-sm font-medium"></p>
         </div>
     </div>
 
-    <div class="max-w-7xl mx-auto">
-        <header class="mb-6 border-b border-gray-800 pb-6 flex flex-col md:flex-row justify-between items-center gap-4">
+    <!-- Main Content -->
+    <div class="max-w-5xl mx-auto px-4 py-8 md:py-12">
+        <header class="flex flex-col md:flex-row justify-between items-center gap-6 mb-12">
             <div>
-                <h1 class="text-4xl font-bold text-white mb-2">📼 Video Vault</h1>
-                <p class="text-gray-400">Encrypted Personal Media Archive</p>
+                <h1 class="text-4xl font-extrabold text-white tracking-tight flex items-center gap-3">
+                    <span class="bg-indigo-600 p-2 rounded-xl">
+                        <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                        </svg>
+                    </span>
+                    Video Vault
+                </h1>
+                <p class="text-gray-500 mt-1 font-medium">Remote Video Scraper & Uploader</p>
             </div>
-            <div class="flex items-center gap-4">
-                <button onclick="logout()" class="text-gray-500 hover:text-red-400 text-sm transition">Logout & Lock</button>
-                <button onclick="loadVideos()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-full font-semibold transition">↻ Refresh</button>
+            <div class="flex items-center gap-3">
+                <button onclick="logout()" class="px-4 py-2 text-gray-500 hover:text-red-400 transition-colors font-medium text-sm">
+                    Lock Session
+                </button>
+                <div class="h-4 w-px bg-gray-800"></div>
+                <div id="connection-status" class="flex items-center gap-2 text-xs font-semibold text-emerald-500 bg-emerald-500/10 px-3 py-1.5 rounded-full border border-emerald-500/20">
+                    <span class="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span>
+                    SYSTEM ONLINE
+                </div>
             </div>
         </header>
 
-        <!-- ── Filter bar ──────────────────────────────────────────────── -->
-        <div class="mb-8 bg-gray-800 border border-gray-700 rounded-xl p-4 flex flex-col md:flex-row gap-4 items-end">
-
-            <!-- Date range -->
-            <div class="flex flex-col gap-1 flex-1">
-                <label class="text-xs uppercase tracking-wider text-gray-400">Date from</label>
-                <input type="date" id="filter-date-from"
-                       class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
+        <!-- Downloader UI -->
+        <div class="glass-panel rounded-[2rem] p-8 md:p-10 mb-12 shadow-2xl relative overflow-hidden">
+            <div class="absolute top-0 right-0 p-8 opacity-10">
+                <svg class="w-32 h-32 text-white" fill="currentColor" viewBox="0 0 20 20">
+                    <path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z"></path>
+                </svg>
             </div>
-            <div class="flex flex-col gap-1 flex-1">
-                <label class="text-xs uppercase tracking-wider text-gray-400">Date to</label>
-                <input type="date" id="filter-date-to"
-                       class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
-            </div>
-
-            <!-- Size range -->
-            <div class="flex flex-col gap-1 flex-1">
-                <label class="text-xs uppercase tracking-wider text-gray-400">Min size (MB)</label>
-                <input type="number" id="filter-size-min" placeholder="0" min="0"
-                       class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
-            </div>
-            <div class="flex flex-col gap-1 flex-1">
-                <label class="text-xs uppercase tracking-wider text-gray-400">Max size (MB)</label>
-                <input type="number" id="filter-size-max" placeholder="∞" min="0"
-                       class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
-            </div>
-
-            <!-- Sort -->
-            <div class="flex flex-col gap-1 flex-1">
-                <label class="text-xs uppercase tracking-wider text-gray-400">Sort by</label>
-                <select id="filter-sort"
-                        class="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-white focus:outline-none focus:border-indigo-500 text-sm">
-                    <option value="date-desc">Newest first</option>
-                    <option value="date-asc">Oldest first</option>
-                    <option value="size-desc">Largest first</option>
-                    <option value="size-asc">Smallest first</option>
-                </select>
-            </div>
-
-            <!-- Actions -->
-            <div class="flex gap-2">
-                <button onclick="applyFilters()"
-                        class="bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2 rounded-lg font-semibold transition text-sm whitespace-nowrap">
-                    Apply
-                </button>
-                <button onclick="clearFilters()"
-                        class="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded-lg transition text-sm whitespace-nowrap">
-                    Clear
-                </button>
+            
+            <div class="relative z-10">
+                <h2 class="text-2xl font-bold text-white mb-6">New Download</h2>
+                <div class="space-y-4">
+                    <div class="relative">
+                        <input type="text" id="video-url" placeholder="Paste video URL here..." 
+                               class="w-full bg-gray-900/50 border border-gray-800 rounded-2xl px-6 py-5 pr-32 focus:outline-none input-glow text-white placeholder-gray-600 transition-all">
+                        <button onclick="startDownload()" id="download-btn"
+                                class="absolute right-2 top-2 bottom-2 bg-indigo-600 hover:bg-indigo-500 text-white px-6 rounded-xl font-bold transition-all flex items-center gap-2">
+                            <span>Scrape</span>
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="flex flex-col md:flex-row gap-4">
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 uppercase tracking-widest mb-2 ml-1">Custom Title (Optional)</label>
+                            <input type="text" id="video-title" placeholder="Enter title override" 
+                                   class="w-full bg-gray-900/50 border border-gray-800 rounded-xl px-4 py-3 focus:outline-none input-glow text-white text-sm">
+                        </div>
+                        <div class="md:w-1/3 flex items-end">
+                            <p class="text-xs text-gray-500 mb-3 italic">Supported: Various video hosting platforms via Scraping module.</p>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
 
-        <!-- ── Stats bar ───────────────────────────────────────────────── -->
-        <div id="stats-bar" class="mb-6 text-sm text-gray-400 hidden">
-            Showing <span id="stats-showing" class="text-white font-semibold"></span> of
-            <span id="stats-total" class="text-white font-semibold"></span> videos
-            <span id="stats-size" class="ml-3 text-gray-500"></span>
-        </div>
+        <!-- Jobs Section -->
+        <div class="space-y-6">
+            <div class="flex items-center justify-between">
+                <h3 class="text-xl font-bold text-white flex items-center gap-2">
+                    Recent Activity
+                    <span id="job-count" class="bg-gray-800 text-gray-400 text-xs px-2 py-1 rounded-md">0</span>
+                </h3>
+                <button onclick="loadJobs()" class="text-indigo-400 hover:text-indigo-300 text-sm font-semibold transition-colors flex items-center gap-2">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                    </svg>
+                    Refresh
+                </button>
+            </div>
 
-        <div id="video-grid" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8 pb-20"></div>
+            <div id="jobs-list" class="grid gap-4">
+                <!-- Skeleton Loader -->
+                <div class="glass-panel p-6 rounded-2xl animate-pulse flex items-center gap-4">
+                    <div class="w-12 h-12 bg-gray-800 rounded-xl"></div>
+                    <div class="flex-1 space-y-2">
+                        <div class="h-4 bg-gray-800 rounded w-1/4"></div>
+                        <div class="h-3 bg-gray-800 rounded w-1/2"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
-        // ── State ──────────────────────────────────────────────────────────
-        let allVideos = [];
+        let jobs = [];
+        let pollIntervals = {};
 
         // ── Auth ───────────────────────────────────────────────────────────
         async function unlock() {
@@ -113,7 +157,7 @@
                 if (res.ok) {
                     localStorage.setItem('vault_pin', pin);
                     document.getElementById('lock-screen').classList.add('hidden');
-                    loadVideos();
+                    loadJobs();
                 } else {
                     errorEl.innerText = "Invalid PIN. Access Denied.";
                     errorEl.classList.remove('hidden');
@@ -129,171 +173,13 @@
             location.reload();
         }
 
-        // ── Delete ─────────────────────────────────────────────────────────
-        async function deleteVideo(id) {
-            if (!confirm("Permanently delete this video?")) return;
-            const pin = localStorage.getItem('vault_pin');
-            try {
-                const res = await fetch(`/api/videos/${id}`, {
-                    method: 'DELETE',
-                    headers: { 'Authorization': pin }
-                });
-                if (res.ok) loadVideos();
-                else alert("Delete failed. Auth error.");
-            } catch (err) {
-                alert("Error connecting to server.");
-            }
-        }
-
-        // ── Lazy loading ───────────────────────────────────────────────────
-      // ── Lazy loading (Animation Only) ──────────────────────────────────────────
-const videoObserver = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-        if (entry.isIntersecting) {
-            entry.target.classList.add('loaded');
-        } else {
-            const video = entry.target.querySelector('video');
-            if (video && !video.paused) video.pause();
-        }
-    });
-}, { threshold: 0.1 });
-
-        // ── Helpers ────────────────────────────────────────────────────────
-        function formatSize(bytes) {
-            if (!bytes || bytes === 0) return null;
-            if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-            if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-            return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-        }
-
-        function totalSizeLabel(videos) {
-            const total = videos.reduce((acc, v) => acc + (v.fileSize || 0), 0);
-            if (total === 0) return '';
-            return `· Total: ${formatSize(total)}`;
-        }
-
-        // ── Filter + sort ──────────────────────────────────────────────────
-        function getFilteredAndSorted() {
-            const dateFrom = document.getElementById('filter-date-from').value;
-            const dateTo   = document.getElementById('filter-date-to').value;
-            const sizeMin  = parseFloat(document.getElementById('filter-size-min').value) || 0;
-            const sizeMax  = parseFloat(document.getElementById('filter-size-max').value) || Infinity;
-            const sort     = document.getElementById('filter-sort').value;
-
-            let filtered = allVideos.filter(v => {
-                const date = new Date(v.processedAt);
-
-                if (dateFrom && date < new Date(dateFrom)) return false;
-                if (dateTo   && date > new Date(dateTo + 'T23:59:59')) return false;
-
-                const sizeMB = (v.fileSize || 0) / 1024 / 1024;
-                if (sizeMB < sizeMin) return false;
-                if (sizeMax !== Infinity && sizeMB > sizeMax) return false;
-
-                return true;
-            });
-
-            filtered.sort((a, b) => {
-                switch (sort) {
-                    case 'date-asc':  return new Date(a.processedAt) - new Date(b.processedAt);
-                    case 'date-desc': return new Date(b.processedAt) - new Date(a.processedAt);
-                    case 'size-asc':  return (a.fileSize || 0) - (b.fileSize || 0);
-                    case 'size-desc': return (b.fileSize || 0) - (a.fileSize || 0);
-                    default:          return 0;
-                }
-            });
-
-            return filtered;
-        }
-
-        function applyFilters() {
-            renderGrid(getFilteredAndSorted());
-        }
-
-        function clearFilters() {
-            document.getElementById('filter-date-from').value = '';
-            document.getElementById('filter-date-to').value   = '';
-            document.getElementById('filter-size-min').value  = '';
-            document.getElementById('filter-size-max').value  = '';
-            document.getElementById('filter-sort').value      = 'date-desc';
-            renderGrid(allVideos);
-        }
-
-        // ── Render ─────────────────────────────────────────────────────────
-       // ── Render ─────────────────────────────────────────────────────────
-        function renderGrid(videos) {
-            const grid = document.getElementById('video-grid');
-            const statsBar     = document.getElementById('stats-bar');
-            const statsShowing = document.getElementById('stats-showing');
-            const statsTotal   = document.getElementById('stats-total');
-            const statsSize    = document.getElementById('stats-size');
-
-            // Update stats bar
-            statsBar.classList.remove('hidden');
-            statsShowing.textContent = videos.length;
-            statsTotal.textContent   = allVideos.length;
-            statsSize.textContent    = totalSizeLabel(videos);
-
-            if (videos.length === 0) {
-                grid.innerHTML = '<div class="col-span-full text-center py-20 text-gray-500">No videos match the current filters.</div>';
-                return;
-            }
-
-            grid.innerHTML = '';
-            videos.forEach(video => {
-                const card = document.createElement('div');
-                card.className = "video-card bg-gray-800 rounded-xl overflow-hidden shadow-2xl border border-gray-700 hover:border-indigo-500 relative group";
-
-                const sizeLabel = formatSize(video.fileSize);
-                const dateLabel = new Date(video.processedAt).toLocaleDateString();
-
-                card.innerHTML = `
-                    <button onclick="deleteVideo('${video._id}')"
-                            class="absolute top-2 right-2 z-10 bg-red-600/80 hover:bg-red-600 text-white p-2 rounded-full opacity-0 group-hover:opacity-100 transition duration-200"
-                            title="Delete Video">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
-                    </button>
-                    
-                    <div class="relative w-full aspect-video bg-black flex items-center justify-center">
-                        <video controls class="w-full h-full hidden" preload="none"></video>
-                        <div class="absolute inset-0 flex items-center justify-center cursor-pointer hover:bg-white/10 transition group/play"
-                             onclick="loadSingleVideo(this, '${video.playUrl}')">
-                            <div class="bg-indigo-600/80 group-hover/play:bg-indigo-500 text-white rounded-full p-4 shadow-lg transition transform group-hover/play:scale-110">
-                                <svg class="w-8 h-8 ml-1" fill="currentColor" viewBox="0 0 20 20">
-                                    <path d="M4 4l12 6-12 6z"></path>
-                                </svg>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="p-4">
-                        <h3 class="font-bold text-white truncate text-sm md:text-base mb-2" title="${video.title}">${video.title || 'Untitled'}</h3>
-                        <div class="flex justify-between items-center text-[10px] uppercase tracking-wider text-gray-500">
-                            <span>${dateLabel}</span>
-                            <div class="flex items-center gap-2">
-                                ${sizeLabel ? `<span class="bg-gray-900 px-2 py-0.5 rounded border border-gray-700">${sizeLabel}</span>` : ''}
-                                <span class="bg-gray-900 px-2 py-0.5 rounded border border-gray-700">${video.type || 'MP4'}</span>
-                            </div>
-                        </div>
-                    </div>
-                `;
-                grid.appendChild(card);
-                videoObserver.observe(card);
-            });
-        }
-
-        // ── Load ───────────────────────────────────────────────────────────
-        async function loadVideos() {
+        // ── Jobs Management ────────────────────────────────────────────────
+        async function loadJobs() {
             const pin = localStorage.getItem('vault_pin');
             if (!pin) return;
 
-            const grid = document.getElementById('video-grid');
-            grid.innerHTML = '<p class="text-gray-500 animate-pulse col-span-full text-center py-20 text-xl">Accessing encrypted records...</p>';
-
             try {
-                const response = await fetch('/api/videos', {
+                const response = await fetch('/api/scrape/jobs', {
                     headers: { 'Authorization': pin }
                 });
 
@@ -302,69 +188,225 @@ const videoObserver = new IntersectionObserver((entries) => {
                     return;
                 }
 
-                const data = await response.json();
-
-                if (data.length === 0) {
-                    grid.innerHTML = '<div class="col-span-full text-center py-20 text-gray-500">The vault is currently empty.</div>';
-                    return;
-                }
-
-                allVideos = data;
-                renderGrid(getFilteredAndSorted());
-
+                jobs = await response.json();
+                // Sort by date desc
+                jobs.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+                renderJobs();
+                
+                // Start polling for active jobs
+                jobs.forEach(job => {
+                    if (['pending', 'scraping', 'storing'].includes(job.status)) {
+                        startPolling(job.jobId);
+                    }
+                });
             } catch (error) {
-                grid.innerHTML = `<div class="col-span-full text-red-400 p-6 border border-red-900 bg-red-900/10 rounded-xl">Connection Error: ${error.message}</div>`;
+                console.error("Failed to load jobs", error);
             }
         }
-// ── On-Demand Video Loading ────────────────────────────────────────
-async function loadSingleVideo(overlayElement, videoUrl) {
-    const container = overlayElement.parentElement;
-    const videoElement = container.querySelector('video');
 
-    // Show a loading spinner on the overlay
-    overlayElement.innerHTML = '<div class="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-500"></div>';
+        function renderJobs() {
+            const list = document.getElementById('jobs-list');
+            const count = document.getElementById('job-count');
+            count.innerText = jobs.length;
 
-    try {
-        let finalUrl = videoUrl;
-        
-        // Fetch signed URL if needed
-        if (videoUrl.includes('/api/public/file/')) {
-            const pin = localStorage.getItem('vault_pin');
-            const hashMatch = videoUrl.match(/\/api\/public\/file\/([a-f0-9]+)$/);
+            if (jobs.length === 0) {
+                list.innerHTML = `
+                    <div class="text-center py-20 bg-gray-900/20 rounded-3xl border border-dashed border-gray-800">
+                        <div class="text-gray-600 mb-2">No download history found.</div>
+                        <div class="text-gray-700 text-xs uppercase tracking-widest">Start by pasting a URL above.</div>
+                    </div>
+                `;
+                return;
+            }
+
+            list.innerHTML = jobs.map(job => createJobCard(job)).join('');
+        }
+
+        function createJobCard(job) {
+            const isProcessing = ['pending', 'scraping', 'storing'].includes(job.status);
+            const isFailed = job.status === 'failed';
+            const isDone = job.status === 'done';
             
-            if (hashMatch) {
-                const hash = hashMatch[1];
-                const response = await fetch(`/api/signed-url/${hash}`, {
-                    headers: { 'Authorization': pin }
+            const progress = job.progress?.percent || 0;
+            const stage = job.progress?.stage || 'Initializing';
+            
+            let statusColor = 'text-gray-400';
+            let statusIcon = '';
+            let bgGlow = '';
+
+            if (isProcessing) {
+                statusColor = 'text-indigo-400';
+                statusIcon = '<div class="w-2 h-2 bg-indigo-500 rounded-full animate-ping"></div>';
+                bgGlow = 'border-indigo-500/20 shadow-lg shadow-indigo-500/5';
+            } else if (isFailed) {
+                statusColor = 'text-red-400';
+                statusIcon = '<div class="w-2 h-2 bg-red-500 rounded-full"></div>';
+                bgGlow = 'border-red-500/10';
+            } else if (isDone) {
+                statusColor = 'text-emerald-400';
+                statusIcon = '<div class="w-2 h-2 bg-emerald-500 rounded-full"></div>';
+                bgGlow = 'border-emerald-500/10';
+            }
+
+            return `
+                <div id="job-${job.jobId}" class="glass-panel p-5 rounded-2xl border ${bgGlow} transition-all duration-500">
+                    <div class="flex items-start gap-4">
+                        <div class="w-12 h-12 rounded-xl bg-gray-800 flex items-center justify-center shrink-0">
+                            ${isProcessing ? `
+                                <svg class="w-6 h-6 text-indigo-500 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                                </svg>
+                            ` : isDone ? `
+                                <svg class="w-6 h-6 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                                </svg>
+                            ` : `
+                                <svg class="w-6 h-6 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                </svg>
+                            `}
+                        </div>
+                        <div class="flex-1 min-w-0">
+                            <div class="flex justify-between items-start mb-1">
+                                <h4 class="font-bold text-white truncate text-base pr-4" title="${job.url}">${job.url}</h4>
+                                <span class="text-[10px] text-gray-500 uppercase tracking-tighter shrink-0 mt-1">${new Date(job.createdAt).toLocaleTimeString()}</span>
+                            </div>
+                            
+                            <div class="flex items-center gap-3 mb-3">
+                                <div class="flex items-center gap-1.5 ${statusColor} text-[10px] font-bold uppercase tracking-widest">
+                                    ${statusIcon}
+                                    ${job.status}
+                                </div>
+                                <div class="h-1 w-1 bg-gray-800 rounded-full"></div>
+                                <div class="text-[10px] text-gray-500 font-medium uppercase tracking-widest">
+                                    ${stage}
+                                </div>
+                            </div>
+
+                            ${isProcessing ? `
+                                <div class="w-full bg-gray-900 h-1.5 rounded-full overflow-hidden">
+                                    <div id="progress-${job.jobId}" class="progress-bar bg-indigo-500 h-full shadow-[0_0_10px_rgba(99,102,241,0.5)]" style="width: ${progress}%"></div>
+                                </div>
+                            ` : isFailed ? `
+                                <div class="text-xs text-red-400 bg-red-400/5 p-3 rounded-lg border border-red-400/10">
+                                    <span class="font-bold uppercase tracking-tighter">Error:</span> ${job.error || 'Unknown failure'}
+                                </div>
+                            ` : `
+                                <div class="text-xs text-emerald-400 bg-emerald-400/5 p-3 rounded-lg border border-emerald-400/10 flex items-center justify-between">
+                                    <span class="truncate pr-4">Successfully uploaded to main instance.</span>
+                                </div>
+                            `}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // ── Actions ────────────────────────────────────────────────────────
+        async function startDownload() {
+            const urlInput = document.getElementById('video-url');
+            const titleInput = document.getElementById('video-title');
+            const btn = document.getElementById('download-btn');
+            
+            const url = urlInput.value.trim();
+            const title = titleInput.value.trim();
+
+            if (!url) return;
+
+            // Simple URL validation
+            if (!url.startsWith('http')) {
+                alert("Please enter a valid URL starting with http:// or https://");
+                return;
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = '<svg class="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>';
+
+            try {
+                const response = await fetch('/api/scrape', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, title })
                 });
-                
+
                 if (response.ok) {
                     const data = await response.json();
-                    if (data.download?.url) {
-                        finalUrl = data.download.url;
-                    }
+                    urlInput.value = '';
+                    titleInput.value = '';
+                    
+                    // Add new job to local state immediately
+                    const newJob = {
+                        jobId: data.jobId,
+                        url: url,
+                        status: 'pending',
+                        createdAt: new Date().toISOString(),
+                        progress: { percent: 5, stage: 'queuing' }
+                    };
+                    jobs.unshift(newJob);
+                    renderJobs();
+                    startPolling(data.jobId);
                 } else {
-                    throw new Error("Failed to authenticate URL");
+                    const error = await response.json();
+                    alert(`Error: ${error.error || 'Failed to start download'}`);
                 }
+            } catch (error) {
+                alert("Network error. Check connection.");
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<span>Scrape</span> <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>';
             }
         }
 
-        // Set the video source, reveal the player, hide the overlay, and play
-        videoElement.src = finalUrl;
-        videoElement.classList.remove('hidden');
-        overlayElement.remove(); // Delete the overlay entirely
-        videoElement.play();
+        function startPolling(jobId) {
+            if (pollIntervals[jobId]) return;
 
-    } catch (e) {
-        console.error(`[Gallery] Error loading video:`, e);
-        overlayElement.innerHTML = '<span class="text-red-500 font-bold text-sm bg-gray-900 p-2 rounded">Failed to load</span>';
-    }
-}
+            pollIntervals[jobId] = setInterval(async () => {
+                try {
+                    const response = await fetch(`/api/scrape/status/${jobId}`);
+                    if (!response.ok) {
+                        clearInterval(pollIntervals[jobId]);
+                        delete pollIntervals[jobId];
+                        return;
+                    }
+
+                    const data = await response.json();
+                    
+                    // Update local state
+                    const idx = jobs.findIndex(j => j.jobId === jobId);
+                    if (idx !== -1) {
+                        jobs[idx] = { ...jobs[idx], ...data };
+                        
+                        // Update UI partially if possible to avoid full re-render
+                        const card = document.getElementById(`job-${jobId}`);
+                        if (card) {
+                            const progBar = document.getElementById(`progress-${jobId}`);
+                            if (progBar && data.progress) {
+                                progBar.style.width = `${data.progress.percent}%`;
+                            }
+                            
+                            // If status changed to something final, re-render all to show success/fail state
+                            if (['done', 'failed'].includes(data.status)) {
+                                clearInterval(pollIntervals[jobId]);
+                                delete pollIntervals[jobId];
+                                renderJobs();
+                            }
+                        } else {
+                            // If card not in DOM for some reason, re-render
+                            renderJobs();
+                        }
+                    }
+                } catch (e) {
+                    console.error("Polling error", e);
+                }
+            }, 2000);
+        }
+
         // ── Init ───────────────────────────────────────────────────────────
         window.addEventListener('DOMContentLoaded', () => {
-            if (localStorage.getItem('vault_pin')) {
+            const pin = localStorage.getItem('vault_pin');
+            if (pin) {
                 document.getElementById('lock-screen').classList.add('hidden');
-                loadVideos();
+                loadJobs();
             }
         });
     </script>
