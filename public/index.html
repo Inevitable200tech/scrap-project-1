@@ -87,25 +87,35 @@
             <div class="relative z-10">
                 <h2 class="text-2xl font-bold text-white mb-6">New Download</h2>
                 <div class="space-y-4">
-                    <div class="relative">
-                        <input type="text" id="video-url" placeholder="Paste video URL here..." 
-                               class="w-full bg-gray-900/50 border border-gray-800 rounded-2xl px-6 py-5 pr-32 focus:outline-none input-glow text-white placeholder-gray-600 transition-all">
-                        <button onclick="startDownload()" id="download-btn"
-                                class="absolute right-2 top-2 bottom-2 bg-indigo-600 hover:bg-indigo-500 text-white px-6 rounded-xl font-bold transition-all flex items-center gap-2">
-                            <span>Scrape</span>
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/>
-                            </svg>
+                    <div class="flex gap-3">
+                        <div class="relative flex-1">
+                            <input type="text" id="video-url" placeholder="Paste video URL here..." 
+                                   class="w-full bg-gray-900/50 border border-gray-800 rounded-2xl px-6 py-5 pr-12 focus:outline-none input-glow text-white placeholder-gray-600 transition-all">
+                            <div class="absolute right-4 top-1/2 -translate-y-1/2">
+                                <svg class="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/>
+                                </svg>
+                            </div>
+                        </div>
+                        <button onclick="fetchInfo()" id="fetch-btn"
+                                class="bg-gray-800 hover:bg-gray-700 text-white px-6 rounded-2xl font-bold transition-all flex items-center gap-2 border border-gray-700">
+                            <span id="fetch-text">Fetch Info</span>
                         </button>
                     </div>
                     <div class="flex flex-col md:flex-row gap-4">
                         <div class="flex-1">
-                            <label class="block text-xs font-bold text-gray-500 uppercase tracking-widest mb-2 ml-1">Custom Title (Optional)</label>
-                            <input type="text" id="video-title" placeholder="Enter title override" 
+                            <label class="block text-xs font-bold text-gray-400 uppercase tracking-widest mb-2 ml-1">Video Title (Edit if needed)</label>
+                            <input type="text" id="video-title" placeholder="Title will appear here after fetching" 
                                    class="w-full bg-gray-900/50 border border-gray-800 rounded-xl px-4 py-3 focus:outline-none input-glow text-white text-sm">
                         </div>
-                        <div class="md:w-1/3 flex items-end">
-                            <p class="text-xs text-gray-500 mb-3 italic">Supported: Various video hosting platforms via Scraping module.</p>
+                        <div class="md:w-1/4 flex items-end">
+                            <button onclick="startDownload()" id="download-btn"
+                                    class="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/20">
+                                <span>Start Download</span>
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/>
+                                </svg>
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -143,6 +153,12 @@
     <script>
         let jobs = [];
         let pollIntervals = {};
+
+        function truncateUrl(url, maxLength = 60) {
+            if (!url) return '';
+            if (url.length <= maxLength) return url;
+            return url.substring(0, maxLength - 3) + '...';
+        }
 
         // ── Auth ───────────────────────────────────────────────────────────
         async function unlock() {
@@ -268,7 +284,7 @@
                         </div>
                         <div class="flex-1 min-w-0">
                             <div class="flex justify-between items-start mb-1">
-                                <h4 class="font-bold text-white truncate text-base pr-4" title="${job.url}">${job.url}</h4>
+                                <h4 class="font-bold text-white truncate text-base pr-4" title="${job.url}">${truncateUrl(job.url)}</h4>
                                 <span class="text-[10px] text-gray-500 uppercase tracking-tighter shrink-0 mt-1">${new Date(job.createdAt).toLocaleTimeString()}</span>
                             </div>
                             
@@ -303,6 +319,48 @@
         }
 
         // ── Actions ────────────────────────────────────────────────────────
+        async function fetchInfo() {
+            const urlInput = document.getElementById('video-url');
+            const titleInput = document.getElementById('video-title');
+            const fetchBtn = document.getElementById('fetch-btn');
+            const fetchText = document.getElementById('fetch-text');
+            
+            const url = urlInput.value.trim();
+            if (!url || !url.startsWith('http')) {
+                alert("Please enter a valid URL first.");
+                return;
+            }
+
+            fetchBtn.disabled = true;
+            fetchText.innerText = "Fetching...";
+            titleInput.placeholder = "Scraping page title...";
+
+            try {
+                const response = await fetch('/api/scrape/info', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+
+                if (response.ok) {
+                    const data = await response.json();
+                    if (data.dead) {
+                        alert(`Warning: Video might be dead. Reason: ${data.deadReason}`);
+                    }
+                    titleInput.value = data.title || '';
+                    titleInput.placeholder = "Enter title override";
+                } else {
+                    const error = await response.json();
+                    alert(`Fetch Error: ${error.error || 'Failed to get info'}`);
+                }
+            } catch (err) {
+                alert("Network error while fetching info.");
+            } finally {
+                fetchBtn.disabled = false;
+                fetchText.innerText = "Fetch Info";
+            }
+        }
+
         async function startDownload() {
             const urlInput = document.getElementById('video-url');
             const titleInput = document.getElementById('video-title');

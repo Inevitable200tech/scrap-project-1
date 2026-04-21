@@ -245,6 +245,25 @@ async function processJob(jobId: string): Promise<void> {
 }
 
 // ── Routes ─────────────────────────────────────────────────────────────────
+app.post('/api/scrape/info', async (req, res): Promise<any> => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'URL required' });
+
+  try {
+    const streamId = Math.random().toString(36).substring(7);
+    const info = await performScrape(url, streamId);
+    return res.json({
+      title: info.title,
+      url: info.originalUrl,
+      videoCount: info.videos?.length || 0,
+      dead: info.dead,
+      deadReason: info.deadReason
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/scrape', async (req, res): Promise<any> => {
   const { url, title } = req.body;
 
