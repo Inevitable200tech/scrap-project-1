@@ -415,7 +415,13 @@ export async function processAndStoreVideo(
     // Wait for FFmpeg to complete
     const [ffmpegResult] = await Promise.allSettled([ffmpegPromise]);
     clearInterval(progressInterval);
-    console.log(`[STORAGE:${jobId}] FFmpeg promise settled: ${ffmpegResult.status}`);
+
+    // Final size check: catch cases where download finished before the first interval tick
+    if (fs.existsSync(tempFilePath)) {
+      bytesReceived = fs.statSync(tempFilePath).size;
+    }
+
+    console.log(`[STORAGE:${jobId}] FFmpeg promise settled: ${ffmpegResult.status} | Final size: ${bytesReceived} bytes`);
 
     clearTimeout(ffmpegTimeoutHandle);
     
