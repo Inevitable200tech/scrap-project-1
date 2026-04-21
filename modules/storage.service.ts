@@ -162,8 +162,8 @@ function buildHeaders(referer: string, origin: string): string {
   ].join('\r\n') + '\r\n';
 }
 
-// FFmpeg args for INSTANT method
-function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean): string[] {
+// FFmpeg args for INSTANT method with FastStart
+function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean, outputPath: string): string[] {
   // Base optimizations to skip the 10-second probing delay and handle flaky servers
   const fastProbeArgs = [
     '-analyzeduration', '5000000',
@@ -183,9 +183,10 @@ function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean)
       '-c:v', 'copy',
       '-c:a', 'copy',
       '-ignore_unknown',
-      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      '-movflags', '+faststart',
       '-f', 'mp4',
-      'pipe:1',
+      '-y',
+      outputPath
     ];
   }
 
@@ -200,9 +201,10 @@ function buildFFmpegArgs(headers: string, videoUrl: string, isCopyMode: boolean)
     '-bsf:a', 'aac_adtstoasc', // Fixes audio mapping when extracting AAC from MPEG-TS chunks
     '-copyts',                // Preserve original timestamps (better for stream stability)
     '-ignore_unknown',        // Ignore unknown streams instead of failing
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    '-movflags', '+faststart',
     '-f', 'mp4',
-    'pipe:1',
+    '-y',
+    outputPath
   ];
 }
 
@@ -345,7 +347,6 @@ export async function processAndStoreVideo(
     }
 
     const isM3U8 = videoUrl.includes('.m3u8');
-    const hash = crypto.createHash('sha256');
 
     const { referer, origin } = getSiteOrigin(videoUrl);
     const headers = buildHeaders(referer, origin);
@@ -363,18 +364,15 @@ export async function processAndStoreVideo(
       modeLabel = 'COPY (HLS → MP4)';
     }
 
-    const ffmpegArgs = buildFFmpegArgs(headers, videoUrl, isCopyMode);
+    const tempFilePath = `/tmp/${jobId}_${Date.now()}.mp4`;
+    const ffmpegArgs = buildFFmpegArgs(headers, videoUrl, isCopyMode, tempFilePath);
     const startTime = Date.now();
 
-    console.log(`[STORAGE:${jobId}] START | Mode: ${modeLabel} | Format: mp4`);
+    console.log(`[STORAGE:${jobId}] START | Mode: ${modeLabel} | Format: mp4 | FastStart: enabled`);
 
     let bytesReceived = 0;
     let ffmpegError: Error | null = null;
     
-    // Write directly to a temporary file on disk instead of memory array
-    const tempFilePath = `/tmp/${jobId}_${Date.now()}.mp4`;
-    const fileStream = fs.createWriteStream(tempFilePath);
-
     const { process: ffmpeg, promise: ffmpegPromise } = spawnFFmpeg(ffmpegArgs);
     ffmpegProc = ffmpeg;
 
@@ -389,51 +387,38 @@ export async function processAndStoreVideo(
       if (text.includes('Error')) console.error(`[FFMPEG:${jobId}]: ${text.trim()}`);
     });
 
+    // Monitor file size for progress
     let lastLogTime = Date.now();
     let lastLogBytes = 0;
+    const progressInterval = setInterval(async () => {
+      try {
+        if (!fs.existsSync(tempFilePath)) return;
+        const stats = fs.statSync(tempFilePath);
+        bytesReceived = stats.size;
 
-    ffmpeg.stdout!.on('data', (chunk: Buffer) => {
-      if (bytesReceived === 0) {
-        console.log(`[STORAGE:${jobId}] FFmpeg started receiving data...`);
-      }
-      hash.update(chunk);
-      fileStream.write(chunk);
-      bytesReceived += chunk.length;
-
-      const now = Date.now();
-      if (now - lastLogTime > 5000) {
-        const mb = (bytesReceived / 1024 / 1024).toFixed(2);
-        const speed = ((bytesReceived - lastLogBytes) / 1024 / 1024 / ((now - lastLogTime) / 1000)).toFixed(2);
-        console.log(`[STORAGE:${jobId}] Downloading... ${mb} MB (${speed} MB/s)`);
-        lastLogTime = now;
-        lastLogBytes = bytesReceived;
-      }
-    });
-
-    ffmpeg.stdout!.on('error', (err: any) => {
-      ffmpegError = new Error(`Stream error: ${err.message}`);
-    });
+        const now = Date.now();
+        if (now - lastLogTime > 5000) {
+          const mb = (bytesReceived / 1024 / 1024).toFixed(2);
+          const speed = ((bytesReceived - lastLogBytes) / 1024 / 1024 / ((now - lastLogTime) / 1000)).toFixed(2);
+          console.log(`[STORAGE:${jobId}] Downloading... ${mb} MB (${speed} MB/s)`);
+          
+          if (onProgress) {
+            onProgress({ stage: 'downloading', percent: 50, bytesProcessed: bytesReceived }).catch(() => {});
+          }
+          
+          lastLogTime = now;
+          lastLogBytes = bytesReceived;
+        }
+      } catch {}
+    }, 2000);
 
     // Wait for FFmpeg to complete
     const [ffmpegResult] = await Promise.allSettled([ffmpegPromise]);
+    clearInterval(progressInterval);
     console.log(`[STORAGE:${jobId}] FFmpeg promise settled: ${ffmpegResult.status}`);
 
     clearTimeout(ffmpegTimeoutHandle);
     
-    // Close the file stream properly and wait for finish
-    console.log(`[STORAGE:${jobId}] Ending file stream...`);
-    fileStream.end();
-    await new Promise<void>((resolve, reject) => {
-      fileStream.on('finish', () => {
-        console.log(`[STORAGE:${jobId}] File stream finished.`);
-        resolve();
-      });
-      fileStream.on('error', (err) => {
-        console.error(`[STORAGE:${jobId}] File stream error: ${err.message}`);
-        reject(err);
-      });
-    });
-
     console.log(`[STORAGE:${jobId}] Checking for errors...`);
     if (ffmpegResult.status === 'rejected') {
       ffmpegError = new Error(`FFmpeg exited with error: ${ffmpegResult.reason}`);
@@ -449,6 +434,13 @@ export async function processAndStoreVideo(
       return { success: false, error: 'No video data' };
     }
 
+    // Calculate hash from the finished file
+    console.log(`[STORAGE:${jobId}] Calculating hash...`);
+    const hash = crypto.createHash('sha256');
+    const readStream = fs.createReadStream(tempFilePath);
+    for await (const chunk of readStream) {
+      hash.update(chunk);
+    }
     const finalHash = hash.digest('hex');
 
     if (onProgress) {
