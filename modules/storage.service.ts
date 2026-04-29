@@ -6,6 +6,7 @@ import { MongoClient, Db } from "mongodb";
 import crypto from "crypto";
 import { spawn } from "child_process";
 import fs from "fs";
+import axios from "axios";
 import { MAIN_INSTANCE, MONGO_URI, MONGO_DB } from "./config.js";
 
 let db: Db;
@@ -130,26 +131,19 @@ function getUrlSecondsRemaining(videoUrl: string): number {
   }
 }
 
-const ORIGIN_HEADERS_CACHE: Record<string, any> = {};
-
 function getSiteOrigin(videoUrl: string): { referer: string; origin: string } {
-  if (videoUrl in ORIGIN_HEADERS_CACHE) return ORIGIN_HEADERS_CACHE[videoUrl];
-  let result;
-  if (/vidsonic/i.test(videoUrl)) result = { referer: 'https://vidsonic.net/', origin: 'https://vidsonic.net' };
-  else if (/vidara/i.test(videoUrl)) result = { referer: 'https://vidara.so/', origin: 'https://vidara.so' };
-  else if (/vidnest/i.test(videoUrl)) result = { referer: 'https://vidnest.to/', origin: 'https://vidnest.to' };
-  else if (/streamtape/i.test(videoUrl)) result = { referer: 'https://streamtape.com/', origin: 'https://streamtape.com' };
-  else if (/boodstream/i.test(videoUrl)) result = { referer: 'https://share.boodstream.cc/', origin: 'https://share.boodstream.cc' };
-  else {
-    try {
-      const u = new URL(videoUrl);
-      result = { referer: u.origin + '/', origin: u.origin };
-    } catch {
-      result = { referer: '', origin: '' };
-    }
+  if (/vidsonic/i.test(videoUrl)) return { referer: 'https://vidsonic.net/', origin: 'https://vidsonic.net' };
+  if (/vidara/i.test(videoUrl)) return { referer: 'https://vidara.so/', origin: 'https://vidara.so' };
+  if (/vidnest/i.test(videoUrl)) return { referer: 'https://vidnest.to/', origin: 'https://vidnest.to' };
+  if (/streamtape/i.test(videoUrl)) return { referer: 'https://streamtape.com/', origin: 'https://streamtape.com' };
+  if (/boodstream/i.test(videoUrl)) return { referer: 'https://share.boodstream.cc/', origin: 'https://share.boodstream.cc' };
+  
+  try {
+    const u = new URL(videoUrl);
+    return { referer: u.origin + '/', origin: u.origin };
+  } catch {
+    return { referer: '', origin: '' };
   }
-  ORIGIN_HEADERS_CACHE[videoUrl] = result;
-  return result;
 }
 
 function buildHeaders(referer: string, origin: string): string {
@@ -264,33 +258,33 @@ async function uploadToMainInstance(
   fileSizeBytes: number
 ): Promise<{ success: boolean; hash?: string; isDuplicate?: boolean; error?: string }> {
   try {
-    const formData = new FormData();
-
-    // Append file as Blob from disk (avoids OOM crash)
-    const blob = await fs.openAsBlob(filePath);
-
-    // Append metadata
-    formData.append('hash', hash);
-    formData.append('title', title || fileName);
-    formData.append('file', blob, fileName)
     console.log(`[MAIN-UPLOAD] 📤 Uploading to main instance: ${MAIN_INSTANCE.url}/api/upload`);
     console.log(`[MAIN-UPLOAD]    File: ${fileName}`);
     console.log(`[MAIN-UPLOAD]    Title: ${title}`);
     console.log(`[MAIN-UPLOAD]    Size: ${(fileSizeBytes / 1024 / 1024).toFixed(2)} MB`);
 
     const uploadUrl = `${MAIN_INSTANCE.url}/api/upload`;
-    const response = await fetch(uploadUrl, {
-      method: 'POST',
-      body: formData,
-      // Note: FormData automatically sets multipart/form-data header
+    
+    // Using axios with a ReadStream avoids loading the entire file into memory
+    const response = await axios.post(uploadUrl, {
+      hash,
+      title: title || fileName,
+      file: fs.createReadStream(filePath)
+    }, {
+      headers: {
+        'Content-Type': 'multipart/form-data'
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      validateStatus: () => true // Allow us to handle status codes manually
     });
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`HTTP ${response.status}: ${error}`);
-    }
+    const result = response.data;
 
-    const result = await response.json();
+    if (response.status >= 400) {
+      const errorText = typeof result === 'string' ? result : JSON.stringify(result);
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
+    }
 
     if (response.status === 200) {
       // 200 = duplicate file
