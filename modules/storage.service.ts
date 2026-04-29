@@ -323,6 +323,8 @@ export async function processAndStoreVideo(
 ): Promise<ProcessingResult> {
   let ffmpegProc: any = null;
 
+  videoUrl = videoUrl.replace('tapeadsenjoyer.com', 'streamtape.com');
+
   try {
     // Check URL expiry
     const secondsLeft = getUrlSecondsRemaining(videoUrl);
@@ -335,15 +337,13 @@ export async function processAndStoreVideo(
           refreshUrl(),
           new Promise<string>((_, reject) => setTimeout(() => reject(new Error('Timeout')), 15000))
         ]);
+        videoUrl = videoUrl.replace('tapeadsenjoyer.com', 'streamtape.com');
       } catch (e: any) {
         return { success: false, error: `Refresh failed: ${e.message}` };
       }
     }
 
     const isM3U8 = videoUrl.includes('.m3u8');
-
-    const { referer, origin } = getSiteOrigin(videoUrl);
-    const headers = buildHeaders(referer, origin);
 
     // Determine if we can use COPY mode
     let isCopyMode = false;
@@ -358,80 +358,116 @@ export async function processAndStoreVideo(
       modeLabel = 'COPY (HLS → MP4)';
     }
 
-    const tempFilePath = `/tmp/${jobId}_${Date.now()}.mp4`;
-    const ffmpegArgs = buildFFmpegArgs(headers, videoUrl, isCopyMode, tempFilePath);
     const startTime = Date.now();
-
-    console.log(`[STORAGE:${jobId}] START | Mode: ${modeLabel} | Format: mp4 | FastStart: enabled`);
-
     let bytesReceived = 0;
-    let ffmpegError: Error | null = null;
-    
-    const { process: ffmpeg, promise: ffmpegPromise } = spawnFFmpeg(ffmpegArgs);
-    ffmpegProc = ffmpeg;
+    let tempFilePath = '';
 
-    const ffmpegTimeoutHandle = setTimeout(() => {
-      if (ffmpegProc && !ffmpegProc.killed) {
-        ffmpegProc.kill('SIGKILL');
-      }
-    }, 600000);
+    const MAX_RETRIES = 2;
+    let attempt = 0;
+    let ffmpegSuccess = false;
 
-    ffmpeg.stderr!.on('data', (data: any) => {
-      const text = data.toString();
-      if (text.includes('Error')) console.error(`[FFMPEG:${jobId}]: ${text.trim()}`);
-    });
-
-    // Monitor file size for progress
-    let lastLogTime = Date.now();
-    let lastLogBytes = 0;
-    const progressInterval = setInterval(async () => {
+    while (attempt <= MAX_RETRIES && !ffmpegSuccess) {
       try {
-        if (!fs.existsSync(tempFilePath)) return;
-        const stats = fs.statSync(tempFilePath);
-        bytesReceived = stats.size;
-
-        const now = Date.now();
-        if (now - lastLogTime > 5000) {
-          const mb = (bytesReceived / 1024 / 1024).toFixed(2);
-          const speed = ((bytesReceived - lastLogBytes) / 1024 / 1024 / ((now - lastLogTime) / 1000)).toFixed(2);
-          console.log(`[STORAGE:${jobId}] Downloading... ${mb} MB (${speed} MB/s)`);
-          
-          if (onProgress) {
-            onProgress({ stage: 'downloading', percent: 50, bytesProcessed: bytesReceived }).catch(() => {});
+        if (attempt > 0) {
+          console.log(`[STORAGE:${jobId}] Retrying FFmpeg (Attempt ${attempt + 1}/${MAX_RETRIES + 1})...`);
+          if (refreshUrl) {
+            console.log(`[STORAGE:${jobId}] Refreshing URL before retry...`);
+            videoUrl = await refreshUrl();
+            videoUrl = videoUrl.replace('tapeadsenjoyer.com', 'streamtape.com');
           }
-          
-          lastLogTime = now;
-          lastLogBytes = bytesReceived;
+          // Slight delay before retry
+          await new Promise(r => setTimeout(r, 2000));
         }
-      } catch {}
-    }, 2000);
 
-    // Wait for FFmpeg to complete
-    const [ffmpegResult] = await Promise.allSettled([ffmpegPromise]);
-    clearInterval(progressInterval);
+        const { referer, origin } = getSiteOrigin(videoUrl);
+        const headers = buildHeaders(referer, origin);
 
-    // Final size check: catch cases where download finished before the first interval tick
-    if (fs.existsSync(tempFilePath)) {
-      bytesReceived = fs.statSync(tempFilePath).size;
-    }
+        tempFilePath = `/tmp/${jobId}_${Date.now()}.mp4`;
+        const ffmpegArgs = buildFFmpegArgs(headers, videoUrl, isCopyMode, tempFilePath);
 
-    console.log(`[STORAGE:${jobId}] FFmpeg promise settled: ${ffmpegResult.status} | Final size: ${bytesReceived} bytes`);
+        console.log(`[STORAGE:${jobId}] START | Mode: ${modeLabel} | Format: mp4 | FastStart: enabled`);
 
-    clearTimeout(ffmpegTimeoutHandle);
-    
-    console.log(`[STORAGE:${jobId}] Checking for errors...`);
-    if (ffmpegResult.status === 'rejected') {
-      ffmpegError = new Error(`FFmpeg exited with error: ${ffmpegResult.reason}`);
-    }
+        let ffmpegError: Error | null = null;
+        
+        const { process: ffmpeg, promise: ffmpegPromise } = spawnFFmpeg(ffmpegArgs);
+        ffmpegProc = ffmpeg;
 
-    if (ffmpegError) {
-      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-      throw ffmpegError;
-    }
-    
-    if (bytesReceived === 0) {
-      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-      return { success: false, error: 'No video data' };
+        const ffmpegTimeoutHandle = setTimeout(() => {
+          if (ffmpegProc && !ffmpegProc.killed) {
+            ffmpegProc.kill('SIGKILL');
+          }
+        }, 600000);
+
+        ffmpeg.stderr!.on('data', (data: any) => {
+          const text = data.toString();
+          if (text.includes('Error')) console.error(`[FFMPEG:${jobId}]: ${text.trim()}`);
+        });
+
+        // Monitor file size for progress
+        let lastLogTime = Date.now();
+        let lastLogBytes = 0;
+        const progressInterval = setInterval(async () => {
+          try {
+            if (!fs.existsSync(tempFilePath)) return;
+            const stats = fs.statSync(tempFilePath);
+            bytesReceived = stats.size;
+
+            const now = Date.now();
+            if (now - lastLogTime > 5000) {
+              const mb = (bytesReceived / 1024 / 1024).toFixed(2);
+              const speed = ((bytesReceived - lastLogBytes) / 1024 / 1024 / ((now - lastLogTime) / 1000)).toFixed(2);
+              console.log(`[STORAGE:${jobId}] Downloading... ${mb} MB (${speed} MB/s)`);
+              
+              if (onProgress) {
+                onProgress({ stage: 'downloading', percent: 50, bytesProcessed: bytesReceived }).catch(() => {});
+              }
+              
+              lastLogTime = now;
+              lastLogBytes = bytesReceived;
+            }
+          } catch {}
+        }, 2000);
+
+        // Wait for FFmpeg to complete
+        const [ffmpegResult] = await Promise.allSettled([ffmpegPromise]);
+        clearInterval(progressInterval);
+
+        // Final size check: catch cases where download finished before the first interval tick
+        if (fs.existsSync(tempFilePath)) {
+          bytesReceived = fs.statSync(tempFilePath).size;
+        }
+
+        console.log(`[STORAGE:${jobId}] FFmpeg promise settled: ${ffmpegResult.status} | Final size: ${bytesReceived} bytes`);
+
+        clearTimeout(ffmpegTimeoutHandle);
+        
+        console.log(`[STORAGE:${jobId}] Checking for errors...`);
+        if (ffmpegResult.status === 'rejected') {
+          ffmpegError = new Error(`FFmpeg exited with error: ${ffmpegResult.reason}`);
+        }
+
+        if (ffmpegError) {
+          throw ffmpegError;
+        }
+        
+        if (bytesReceived === 0) {
+          throw new Error('No video data');
+        }
+
+        ffmpegSuccess = true;
+      } catch (err: any) {
+        if (ffmpegProc && !ffmpegProc.killed) {
+          ffmpegProc.kill('SIGKILL');
+        }
+        if (fs.existsSync(tempFilePath)) {
+          try { fs.unlinkSync(tempFilePath); } catch (e) {}
+        }
+        console.error(`[STORAGE:${jobId}] FFmpeg attempt ${attempt + 1} failed: ${err.message}`);
+        attempt++;
+        if (attempt > MAX_RETRIES) {
+          return { success: false, error: err.message };
+        }
+      }
     }
 
     // Calculate hash from the finished file
