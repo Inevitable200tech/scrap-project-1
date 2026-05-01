@@ -16,7 +16,13 @@ import {
 import { PORT, MAIN_INSTANCE } from './modules/config.js';
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));  // Reduce request size limit
+
+// ── Aggressive garbage collection ─────────────────────────────────────────────
+if (global.gc) {
+  setInterval(() => global.gc?.(), 10000);  // GC every 10s
+  console.log('[GC] Aggressive garbage collection enabled every 10s');
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

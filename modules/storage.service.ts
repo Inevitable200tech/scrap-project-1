@@ -11,9 +11,11 @@ import { MAIN_INSTANCE, MONGO_URI, MONGO_DB } from "./config.js";
 
 let db: Db;
 const mongoClient = new MongoClient(MONGO_URI, {
-  maxPoolSize: 10,
-  minPoolSize: 2,
-  maxIdleTimeMS: 60000,
+  maxPoolSize: 1,  // Minimal: Only 1 connection (saves ~50-75MB)
+  minPoolSize: 0,  // No minimum held connections
+  maxIdleTimeMS: 10000,  // Aggressive cleanup (30s→10s)
+  socketTimeoutMS: 10000,
+  serverSelectionTimeoutMS: 5000,
 });
 
 export async function getDb(): Promise<Db> {

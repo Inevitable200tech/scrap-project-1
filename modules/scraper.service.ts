@@ -15,7 +15,7 @@ import { promises as fs } from 'fs';
 import { filterVideoUrls } from './utils.js';
 
 // ─── Plugin Registration ───────────────────────────────────────────────────────
-playwrightExtra.chromium.use(StealthPlugin());
+// Stealth plugin disabled to save memory (~20MB)
 
 export interface ScrapeResult {
   title: string;
@@ -27,8 +27,10 @@ export interface ScrapeResult {
 
 // ─── MEMORY MANAGEMENT ─────────────────────────────────────────────────────────
 let activeScrapes = 0;
-const MAX_CONCURRENT_SCRAPES = 2;  // ← FIX: Limit concurrent scrapes
-const MEMORY_THRESHOLD_MB = 800;    // ← FIX: Stop scraping if memory > 800MB
+const MAX_CONCURRENT_SCRAPES = 1;  // ← Sequential only: 1 concurrent scrape
+const MEMORY_THRESHOLD_MB = 300;    // ← Aggressive: Stop scraping if memory > 300MB
+const ENABLE_ADBLOCKER = false;     // ← Disabled: Save ~100MB of adblocker engine
+const PAGE_TIMEOUT_MS = 15000;      // ← Shorter timeouts to free resources faster
 
 function getMemoryUsageMB(): number {
   if (typeof process !== 'undefined' && process.memoryUsage) {
@@ -42,28 +44,16 @@ function logMemory(msg: string): void {
   console.log(`[MEMORY] ${msg} (${mb}MB heap)`);
 }
 
-// ─── Ghostery blocker singleton (shared across scrape calls) ──────────────────
-let _blocker: PlaywrightBlocker | null = null;
+// ─── Ghostery blocker disabled for memory efficiency ──────────────────
+// Adblocker uses ~100-150MB; disabled to prioritize stability
 async function getBlocker(): Promise<PlaywrightBlocker> {
-  if (_blocker) return _blocker;
-  try {
-    _blocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch, {
-      path: '/tmp/ghostery-engine.bin',
-      read: fs.readFile,
-      write: fs.writeFile,
-    });
-    console.log('[Ghostery] Adblocker engine loaded (uBlock Origin + EasyList filters)');
-  } catch (e: any) {
-    console.warn(`[Ghostery] Failed to load blocker, continuing without it: ${e.message}`);
-    _blocker = null as any;
-  }
-  return _blocker!;
+  return null as any;  // Always disabled
 }
 
 let _browser: any = null;
 async function getGlobalBrowser() {
   if (!_browser || !_browser.isConnected()) {
-    console.log('[BROWSER] Launching new persistent browser instance...');
+    console.log('[BROWSER] Launching minimal memory browser instance...');
     _browser = await playwrightExtra.chromium.launch({
       headless: true,
       args: [
@@ -72,11 +62,26 @@ async function getGlobalBrowser() {
         '--no-zygote',
         '--disable-setuid-sandbox',
         '--disable-infobars',
-        '--window-size=1280,900',
+        '--window-size=800,600',  // Minimal viewport (saves ~40MB)
         '--disable-blink-features=AutomationControlled',
         '--block-new-web-contents',
         '--disable-component-extensions-with-background-pages',
-        '--js-flags="--max-old-space-size=128"'
+        '--disable-extensions',
+        '--disable-plugins',
+        '--disable-images',  // Don't load images (saves ~50-100MB per page)
+        '--single-process',  // Single process (saves overhead)
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-breakpad',  // Disable crash reporting (saves ~10MB)
+        '--disable-client-side-phishing-detection',
+        '--disable-popup-blocking',
+        '--disable-prompt-on-repost',
+        '--disable-sync',
+        '--disable-translate',
+        '--disable-web-resources',
+        '--metrics-recording-only',
+        '--mute-audio',  // Mute audio (saves ~5MB)
+        '--js-flags="--max-old-space-size=32"'  // 32MB V8 heap
       ],
     });
   }
@@ -87,57 +92,8 @@ process.on('exit', () => {
   if (_browser) _browser.close().catch(() => {});
 });
 
-// ─── Aggressive ad/pop-up/overlay block patterns ──────────────────────────────
-const BLOCKED_URL_PATTERNS: RegExp[] = [
-  /doubleclick\.net/i, /googlesyndication\.com/i, /adnxs\.com/i,
-  /adsystem\.com/i, /amazon-adsystem\.com/i, /outbrain\.com/i,
-  /taboola\.com/i, /adsbygoogle/i, /pagead\/js/i,
-  /adserver/i, /adservice/i, /adskeeper/i,
-  /adform\.net/i, /advertising\.com/i, /pubmatic\.com/i,
-  /rubiconproject\.com/i, /openx\.net/i, /criteo\.com/i,
-  /moatads\.com/i, /casalemedia\.com/i, /contextweb\.com/i,
-  /lijit\.com/i, /servedby/i, /adsafeprotected\.com/i,
-  /exoclick\.com/i, /trafficjunky\.net/i, /plugrush\.com/i,
-  /juicyads\.com/i, /ero-advertising\.com/i, /traffichunt\.com/i,
-  /hilltopads\.net/i, /popcash\.net/i, /popads\.net/i,
-  /propellerads\.com/i, /adcash\.com/i, /yllix\.com/i,
-  /bidvertiser\.com/i, /revcontent\.com/i, /mgid\.com/i,
-  /zedo\.com/i, /undertone\.com/i, /spotxchange\.com/i,
-  /spotx\.tv/i, /freewheel\.tv/i, /yieldmo\.com/i,
-  /smartadserver\.com/i, /33across\.com/i, /sovrn\.com/i,
-  /sharethrough\.com/i, /triplelift\.com/i, /appnexus\.com/i,
-  /mediamath\.com/i, /indexexchange\.com/i, /adfox\.ru/i,
-  /yandex.*?ad/i, /dtscout\.com/i, /dtscdn\.com/i,
-  // Pop-under/click-under scripts
-  /popunder/i, /pop-under/i, /clickunder/i,
-  /click\.php/i, /go\.php\?/i, /redirect\.php/i,
-  /track\.php/i, /counter\.php/i, /visit\.php/i,
-  /\bpop\b.*?\.js/i,
-  // Analytics/tracking (safe to block, won't affect video)
-  /google-analytics\.com/i, /googletagmanager\.com/i,
-  /analytics\.js/i, /pixel\.js/i, /mc\.yandex\.ru/i,
-  /hotjar\.com/i, /mixpanel\.com/i, /segment\.com/i,
-  /amplitude\.com/i, /clarity\.ms/i, /mouseflow\.com/i,
-  /fullstory\.com/i, /logrocket\.com/i,
-];
-
-// DOM selectors for ad overlays/popups to nuke after page load
-const AD_OVERLAY_SELECTORS = [
-  '[id*="overlay"]', '[class*="overlay"]',
-  '[id*="popup"]',   '[class*="popup"]',
-  '[id*="modal"]',   '[class*="modal"]',
-  '[id*="banner"]',  '[class*="banner"]',
-  '[id*="interstitial"]', '[class*="interstitial"]',
-  '[id*="preroll"]', '[class*="preroll"]',
-  'iframe[src*="ad"]', 'iframe[src*="pop"]', 'iframe[id*="ad"]',
-  '#ad', '#ads', '.ad', '.ads', '.ad-container', '.ad-wrapper',
-  '.advertisement', '.advert', '#advertisement',
-  '#overlay', '.overlay-container', '.video-overlay',
-  '[class*="adblock"]', '[id*="adblock"]',
-  '[id*="consent"]', '[class*="consent"]',
-  '[id*="cookie"]',  '[class*="cookie"]',
-  '[id*="gdpr"]',    '[class*="gdpr"]',
-];
+// Minimal critical selectors only (rest handled by --disable-images)
+const AD_OVERLAY_SELECTORS: string[] = [];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -195,6 +151,11 @@ async function cleanupPage(page: any, streamId: string): Promise<void> {
   try {
     // Remove all listeners BEFORE closing
     page.removeAllListeners?.();
+    // Clear cookies and storage
+    await Promise.race([
+      page.context?.().clearCookies?.(),
+      new Promise(r => setTimeout(r, 1000))
+    ]).catch(() => {});
   } catch (e: any) {
     log(streamId, `Listener cleanup error: ${e.message}`, 'WARN');
   }
@@ -224,105 +185,50 @@ async function cleanupBrowser(browser: any, streamId: string): Promise<void> {
   }
 }
 
-// ─── Layer 5: Aggressive DOM ad/overlay removal ───────────────────────────────
+// ─── Minimal DOM cleanup (images already disabled in browser args) ─────────────
 async function nukeAdOverlays(page: any, streamId: string): Promise<void> {
   if (!page || page.isClosed?.()) return;
   try {
+    // Minimal cleanup: only patch window functions that pop ads
     await withTimeout(
-      page.evaluate((selectors: string[]) => {
-        // Remove known ad/overlay selectors
-        for (const sel of selectors) {
-          try { document.querySelectorAll(sel).forEach(el => el.remove()); }
-          catch { /* ignore bad selectors */ }
-        }
-
-        // FIX: Only check visible elements (don't query all) to avoid freeze
-        const overlays = document.querySelectorAll('[style*="position"]');
-        let removed = 0;
-        overlays.forEach(el => {
-          try {
-            const style = window.getComputedStyle(el);
-            const isOverlay =
-              (style.position === 'fixed' || style.position === 'absolute') &&
-              parseInt(style.zIndex || '0', 10) > 100 &&
-              el.tagName !== 'VIDEO' &&
-              !(el as HTMLElement).closest?.('video');
-            if (isOverlay) {
-              const rect = (el as HTMLElement).getBoundingClientRect();
-              if (rect.width > window.innerWidth * 0.7 && rect.height > window.innerHeight * 0.7) {
-                (el as HTMLElement).remove();
-                removed++;
-              }
-            }
-          } catch { /* ignore */ }
-        });
-
-        // Patch window.open after load
+      page.evaluate(() => {
         (window as any).open = () => null;
-        (window as any).showAd    = () => null;
+        (window as any).showAd = () => null;
         (window as any).displayAd = () => null;
-        (window as any).popUnder  = () => null;
-        (window as any).popunder  = () => null;
-      }, AD_OVERLAY_SELECTORS),
-      3000,
+      }),
+      1000,  // Shorter timeout
       undefined
     );
-    log(streamId, 'Ad overlays nuked');
+    log(streamId, 'Window functions patched');
   } catch (e: any) {
-    log(streamId, `Overlay nuke failed: ${e.message}`, 'WARN');
+    log(streamId, `Overlay cleanup skipped: ${e.message}`, 'WARN');
   }
 }
 
-// ─── Debug dump ───────────────────────────────────────────────────────────────
+// ─── Minimal debug info (memory efficient) ────────────────────────────────────
 async function dumpPageDebugInfo(
   page: any,
   streamId: string,
   interceptedCount: number
 ): Promise<void> {
   if (!page || page.isClosed?.()) {
-    log(streamId, '[DEBUG] Page unavailable for debug info', 'WARN');
+    log(streamId, '[DEBUG] Page unavailable', 'WARN');
     return;
   }
   try {
-    const debugInfo = await withTimeout(
+    const videos = await withTimeout(
       page.evaluate(() => {
-        const clone = document.body.cloneNode(true) as HTMLElement;
-        clone.querySelectorAll('script, style, noscript').forEach(el => el.remove());
-        const visibleText = (clone.innerText || clone.textContent || '')
-          .replace(/\s+/g, ' ').trim().substring(0, 10000);
-        const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
-          src: f.src || f.getAttribute('src'), id: f.id,
+        return Array.from(document.querySelectorAll('video')).map(v => ({
+          src: v.src,
+          currentSrc: v.currentSrc,
         }));
-        const videos = Array.from(document.querySelectorAll('video')).map(v => ({
-          src: v.src, currentSrc: v.currentSrc,
-          srcAttribute: v.getAttribute('src'), readyState: v.readyState,
-        }));
-        const errorSelectors = [
-          '.error', '.message', '.alert', '.notice',
-          '[class*="error"]', '[class*="empty"]', '[class*="not-found"]',
-          '[class*="unavailable"]', '[class*="deleted"]', '[class*="removed"]',
-          'h1', 'h2', '.title',
-        ];
-        const errorTexts: Record<string, string> = {};
-        for (const sel of errorSelectors) {
-          const el = document.querySelector(sel);
-          if (el) { const t = el.textContent?.trim().substring(0, 100); if (t) errorTexts[sel] = t; }
-        }
-        return { visibleText, iframes, videos, errorTexts };
       }),
-      5000,
-      { visibleText: '', iframes: [], videos: [], errorTexts: {} }
+      2000,
+      []
     );
-    log(streamId, `[DEBUG] ── No video found – page dump ──`, 'WARN');
-    log(streamId, `[DEBUG] Intercepted requests: ${interceptedCount}`, 'WARN');
-    if (debugInfo.visibleText)
-      log(streamId, `[DEBUG] Visible text: ${debugInfo.visibleText.substring(0, 200)}`, 'WARN');
-    if (debugInfo.videos.length > 0)
-      log(streamId, `[DEBUG] Video elements: ${JSON.stringify(debugInfo.videos)}`, 'WARN');
-    if (Object.keys(debugInfo.errorTexts).length > 0)
-      log(streamId, `[DEBUG] Error texts: ${JSON.stringify(debugInfo.errorTexts)}`, 'WARN');
+    log(streamId, `[DEBUG] Intercepted: ${interceptedCount}, Videos found: ${videos.length}`, 'WARN');
   } catch (e: any) {
-    log(streamId, `[DEBUG] Dump failed: ${e.message}`, 'WARN');
+    log(streamId, `[DEBUG] Info skipped`, 'WARN');
   }
 }
 

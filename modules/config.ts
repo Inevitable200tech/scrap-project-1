@@ -15,6 +15,7 @@ function requireEnv(name: string): string {
 
 export const PORT = parseInt(process.env.PORT || '3000', 10);
 export const USER_DATA_DIR = path.join(os.tmpdir(), 'scraper-profile');
+export const GC_INTERVAL_MS = 10000;  // Garbage collection every 10s
 
 export const BROWSER_ARGS = [
     '--no-sandbox', 
