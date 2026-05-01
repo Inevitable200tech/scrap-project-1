@@ -449,28 +449,7 @@ async function scrapeWithCleanup(url: string, streamId: string): Promise<ScrapeR
     page = await context.newPage();
     log(streamId, 'Page opened');
 
-    // ── Layer 0: Ghostery adblocker (uBlock Origin + EasyList filter lists) ──
-    try {
-      const blocker = await getBlocker();
-      if (blocker) {
-        await blocker.enableBlockingInPage(page);
-        log(streamId, 'Ghostery adblocker active on page');
-      }
-    } catch (e: any) {
-      log(streamId, `Ghostery enableBlockingInPage failed: ${e.message}`, 'WARN');
-    }
-
-    // ── Layer 1: Playwright route interception (custom blocklist) ─────────────
-    await page.route('**/*', async (route: any) => {
-      const reqUrl: string = route.request().url();
-      if (BLOCKED_URL_PATTERNS.some(p => p.test(reqUrl))) {
-        await route.abort('blockedbyclient');
-        return;
-      }
-      await route.continue();
-    });
-
-    // ── Layer 2: Network video sniffer ────────────────────────────────────────
+    // ── Layer 1: Network video sniffer ────────────────────────────────────────
     const onRequest = (request: { url: () => string }) => {
       const reqUrl = request.url();
       if (
@@ -492,7 +471,7 @@ async function scrapeWithCleanup(url: string, streamId: string): Promise<ScrapeR
     page.on('close', onPageClose);
     page.on('console', onConsole);
 
-    // ── Layer 3: Popup / new-tab suppression ──────────────────────────────────
+    // ── Layer 2: Popup / new-tab suppression ──────────────────────────────────
     const onPopup = async (popup: any) => {
       if (popup === page) return;
       try {
@@ -506,7 +485,7 @@ async function scrapeWithCleanup(url: string, streamId: string): Promise<ScrapeR
 
     context.on('page', onPopup);
 
-    // ── Layer 4: Patch window.open + ad globals BEFORE any page JS runs ───────
+    // ── Layer 3: Patch window.open + ad globals BEFORE any page JS runs ───────
     await page.addInitScript(() => {
       window.open = () => null as any;
       try {
