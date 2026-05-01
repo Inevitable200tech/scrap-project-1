@@ -29,7 +29,7 @@ export interface ScrapeResult {
 let activeScrapes = 0;
 const MAX_CONCURRENT_SCRAPES = 1;  // ← Sequential only: 1 concurrent scrape
 const MEMORY_THRESHOLD_MB = 300;    // ← Aggressive: Stop scraping if memory > 300MB
-const ENABLE_ADBLOCKER = false;     // ← Disabled: Save ~100MB of adblocker engine
+const ENABLE_ADBLOCKER = true;      // ← Enabled: Ad blocking protection
 const PAGE_TIMEOUT_MS = 15000;      // ← Shorter timeouts to free resources faster
 
 function getMemoryUsageMB(): number {
@@ -44,10 +44,21 @@ function logMemory(msg: string): void {
   console.log(`[MEMORY] ${msg} (${mb}MB heap)`);
 }
 
-// ─── Ghostery blocker disabled for memory efficiency ──────────────────
-// Adblocker uses ~100-150MB; disabled to prioritize stability
-async function getBlocker(): Promise<PlaywrightBlocker> {
-  return null as any;  // Always disabled
+// ─── Ghostery blocker for ad blocking ──────────────────────────────────────
+let _blocker: PlaywrightBlocker | null = null;
+async function getBlocker(): Promise<PlaywrightBlocker | null> {
+  if (!ENABLE_ADBLOCKER) return null;
+  if (_blocker) return _blocker;
+  
+  try {
+    console.log('[ADBLOCKER] Loading Ghostery blocker engine...');
+    _blocker = await PlaywrightBlocker.fromPrebuiltAdsAndTracking(fetch);
+    console.log('[ADBLOCKER] Blocker loaded successfully');
+    return _blocker;
+  } catch (e: any) {
+    console.error('[ADBLOCKER] Failed to load:', e.message);
+    return null;
+  }
 }
 
 let _browser: any = null;
@@ -92,8 +103,21 @@ process.on('exit', () => {
   if (_browser) _browser.close().catch(() => {});
 });
 
-// Minimal critical selectors only (rest handled by --disable-images)
-const AD_OVERLAY_SELECTORS: string[] = [];
+// Ad overlay selectors for manual cleanup
+const AD_OVERLAY_SELECTORS: string[] = [
+  '.advert',
+  '.advertisement',
+  '[data-adblox-slot]',
+  '.modal-overlay',
+  '.popup-ad',
+  '.ad-container',
+  '[id*="ad"]',
+  '[id*="advert"]',
+  '[class*="ad-"]',
+  '[class*="advert"]',
+  'iframe[src*="ads"]',
+  'iframe[src*="doubleclick"]',
+];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -189,17 +213,38 @@ async function cleanupBrowser(browser: any, streamId: string): Promise<void> {
 async function nukeAdOverlays(page: any, streamId: string): Promise<void> {
   if (!page || page.isClosed?.()) return;
   try {
-    // Minimal cleanup: only patch window functions that pop ads
+    // Remove ad overlays from DOM
+    await withTimeout(
+      page.evaluate((selectors: string[]) => {
+        let removed = 0;
+        for (const selector of selectors) {
+          try {
+            const elements = document.querySelectorAll(selector);
+            elements.forEach(el => {
+              (el as HTMLElement).remove?.();
+              removed++;
+            });
+          } catch (e) {
+            // Skip invalid selectors
+          }
+        }
+        return removed;
+      }, AD_OVERLAY_SELECTORS),
+      2000,
+      0
+    );
+
+    // Patch window functions that pop ads
     await withTimeout(
       page.evaluate(() => {
         (window as any).open = () => null;
         (window as any).showAd = () => null;
         (window as any).displayAd = () => null;
       }),
-      1000,  // Shorter timeout
+      1000,
       undefined
     );
-    log(streamId, 'Window functions patched');
+    log(streamId, 'Ad overlays cleaned');
   } catch (e: any) {
     log(streamId, `Overlay cleanup skipped: ${e.message}`, 'WARN');
   }
@@ -448,6 +493,19 @@ async function scrapeWithCleanup(url: string, streamId: string): Promise<ScrapeR
 
     page = await context.newPage();
     log(streamId, 'Page opened');
+
+    // ── Apply ad blocker if enabled ──────────────────────────────────────────
+    if (ENABLE_ADBLOCKER) {
+      try {
+        const blocker = await getBlocker();
+        if (blocker) {
+          await blocker.enableBlockingInPage(page);
+          log(streamId, 'Ad blocker enabled');
+        }
+      } catch (e: any) {
+        log(streamId, `Ad blocker activation failed: ${e.message}`, 'WARN');
+      }
+    }
 
     // ── Layer 1: Network video sniffer ────────────────────────────────────────
     const onRequest = (request: { url: () => string }) => {
